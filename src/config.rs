@@ -300,6 +300,7 @@ pub struct ReplayConfig {
     pub minimize_to_tray_on_close: bool,
     pub play_sound_on_save: bool,
     pub suppress_notifications_in_game: bool,
+    pub auto_check_updates: bool,
 }
 
 impl Default for ReplayConfig {
@@ -343,6 +344,7 @@ impl Default for ReplayConfig {
             minimize_to_tray_on_close: true,
             play_sound_on_save: true,
             suppress_notifications_in_game: true,
+            auto_check_updates: true,
         }
     }
 }
@@ -587,6 +589,11 @@ impl ReplayConfig {
                         self.suppress_notifications_in_game = b;
                     }
                 }
+                "AutoCheckUpdates" => {
+                    if let Ok(b) = parse_bool(val) {
+                        self.auto_check_updates = b;
+                    }
+                }
                 _ => {}
             }
         }
@@ -632,7 +639,8 @@ impl ReplayConfig {
              TempFolder={}\n\
              MinimizeToTrayOnClose={}\n\
              PlaySoundOnSave={}\n\
-             SuppressNotificationsInGame={}\n",
+             SuppressNotificationsInGame={}\n\
+             AutoCheckUpdates={}\n",
             self.monitor_index,
             self.use_native_resolution,
             self.replay_duration_seconds,
@@ -660,7 +668,8 @@ impl ReplayConfig {
             self.temp_folder,
             self.minimize_to_tray_on_close,
             self.play_sound_on_save,
-            self.suppress_notifications_in_game
+            self.suppress_notifications_in_game,
+            self.auto_check_updates
         );
         let _ = fs::write(Self::config_file_path(), content);
     }
@@ -811,5 +820,17 @@ mod tests {
 
         cfg.apply_ini_str("Codec=99\n");
         assert_eq!(cfg.codec, VideoCodecType::HardwareH264);
+    }
+
+    #[test]
+    fn auto_check_updates_ini_roundtrip() {
+        let mut cfg = ReplayConfig::default();
+        assert!(cfg.auto_check_updates);
+
+        cfg.apply_ini_str("AutoCheckUpdates=false\n");
+        assert!(!cfg.auto_check_updates);
+
+        cfg.apply_ini_str("AutoCheckUpdates=1\n");
+        assert!(cfg.auto_check_updates);
     }
 }

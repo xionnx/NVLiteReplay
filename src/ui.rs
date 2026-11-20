@@ -66,7 +66,8 @@ use crate::config::{
     BufferStorageMode, HotkeyBinding, HotkeyPresetType, VideoCodecType, HK_MOD_ALT, HK_MOD_CONTROL,
     HK_MOD_SHIFT, HK_MOD_WIN,
 };
-use crate::engine::{ReplayEngine, WM_APP_SAVED, WM_APP_STATUS, WM_APP_VOICE_TRIGGER};
+use crate::engine::{ReplayEngine, WM_APP_SAVED, WM_APP_STATUS, WM_APP_UPDATE, WM_APP_VOICE_TRIGGER};
+use crate::updater::{UpdateState, APP_VERSION};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_PRINTCLIENT: u32 = 0x0318;
@@ -82,9 +83,10 @@ const ID_TRAY_TOGGLE: usize = 2002;
 const ID_TRAY_SAVE: usize = 2003;
 const ID_TRAY_FOLDER: usize = 2004;
 const ID_TRAY_EXIT: usize = 2005;
+const ID_TRAY_UPDATE: usize = 2006;
 
 const LOGICAL_W: f32 = 680.0;
-const LOGICAL_H: f32 = 656.0;
+const LOGICAL_H: f32 = 700.0;
 
 static UI_PTR: OnceLock<usize> = OnceLock::new();
 
@@ -299,9 +301,14 @@ const R_HK_PRESET_2: RectF = RectF::new(364.0, 297.0, 112.0, 26.0);
 const R_BTN_BROWSE: RectF = RectF::new(544.0, 370.0, 116.0, 32.0);
 const R_BTN_TEMP_BROWSE: RectF = RectF::new(466.0, 434.0, 116.0, 32.0);
 const R_BTN_TEMP_RESET: RectF = RectF::new(588.0, 434.0, 72.0, 32.0);
-const R_TOG_TRAY: RectF = RectF::new(618.0, 523.0, 42.0, 22.0);
-const R_TOG_BEEP: RectF = RectF::new(618.0, 563.0, 42.0, 22.0);
-const R_TOG_FOCUS: RectF = RectF::new(618.0, 603.0, 42.0, 22.0);
+const R_TOG_TRAY: RectF = RectF::new(618.0, 506.0, 42.0, 22.0);
+const R_TOG_BEEP: RectF = RectF::new(618.0, 540.0, 42.0, 22.0);
+const R_TOG_FOCUS: RectF = RectF::new(618.0, 574.0, 42.0, 22.0);
+const R_TOG_AUTO_UPDATE: RectF = RectF::new(618.0, 608.0, 42.0, 22.0);
+
+// Global Footer GitHub Update Bar (y=646..700)
+const R_BTN_GITHUB_PAGE: RectF = RectF::new(426.0, 658.0, 94.0, 30.0);
+const R_BTN_UPDATE_ACTION: RectF = RectF::new(528.0, 658.0, 132.0, 30.0);
 
 // Tab 3 geometry (Voice Clip)
 const R_TOG_VOICE: RectF = RectF::new(600.0, 229.0, 42.0, 22.0);
@@ -925,6 +932,15 @@ unsafe fn open_folder_in_explorer(folder: &str) {
     let _ = ShellExecuteW(None, PCWSTR(op.as_ptr()), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOW);
 }
 
+unsafe fn open_url_in_browser(url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    let op = wide_null("open");
+    let target = wide_null(url);
+    let _ = ShellExecuteW(None, PCWSTR(op.as_ptr()), PCWSTR(target.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOW);
+}
+
 fn compact_path_label(path: &str, max_chars: usize) -> String {
     let total = path.chars().count();
     if total <= max_chars || max_chars < 10 {
@@ -976,6 +992,12 @@ unsafe fn show_tray_menu(state: &UiState) {
     });
     let w_save = wide_null("Simpan Replay Sekarang");
     let w_dir = wide_null("Buka Folder Video");
+    let update_label = match state.engine.updater.snapshot() {
+        UpdateState::Available { latest_tag, .. } => format!("Update Tersedia ({})!", latest_tag),
+        UpdateState::Checking | UpdateState::Downloading { .. } => "Memeriksa Update...".to_string(),
+        _ => format!("Periksa Update (v{})", APP_VERSION),
+    };
+    let w_upd = wide_null(&update_label);
     let w_exit = wide_null("Keluar Aplikasi (Exit)");
 
     let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_OPEN, PCWSTR(w_open.as_ptr()));
@@ -985,6 +1007,7 @@ unsafe fn show_tray_menu(state: &UiState) {
         let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_SAVE, PCWSTR(w_save.as_ptr()));
     }
     let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_FOLDER, PCWSTR(w_dir.as_ptr()));
+    let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_UPDATE, PCWSTR(w_upd.as_ptr()));
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_EXIT, PCWSTR(w_exit.as_ptr()));
 
@@ -1699,6 +1722,10 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
         ),
     }
 
+    // ---- 3b. Global Bottom Footer (Version + GitHub Releases Check/Install) ----
+    let up_state = state.engine.updater.snapshot();
+    paint_update_footer(rt, brush, d2d, &up_state, hx, hy, drop_open);
+
     // ---- 4. Floating Custom Dropdown Overlay (if open) ----
     if let Some(kind) = drop_open {
         paint_dropdown_overlay(rt, brush, d2d, kind, &cfg, &displays, &mic_devices, hx, hy);
@@ -2234,21 +2261,194 @@ unsafe fn paint_tab_system(
         if trst_active { COL_TEXT_SUB } else { COL_TEXT_DIM },
     );
 
-    draw_hline(rt, brush, 20.0, 660.0, 482.0, COL_DIVIDER);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 494.0, 300.0, 16.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
+    draw_hline(rt, brush, 20.0, 660.0, 476.0, COL_DIVIDER);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 484.0, 300.0, 16.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
 
     let rows = [
-        (R_TOG_TRAY, 516.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
-        (R_TOG_BEEP, 556.0, "Bunyi Beep konfirmasi saat klip replay tersimpan", cfg.play_sound_on_save),
-        (R_TOG_FOCUS, 596.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
+        (R_TOG_TRAY, 502.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
+        (R_TOG_BEEP, 536.0, "Bunyi Beep konfirmasi saat klip replay tersimpan", cfg.play_sound_on_save),
+        (R_TOG_FOCUS, 570.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
+        (R_TOG_AUTO_UPDATE, 604.0, "Periksa pembaruan GitHub Releases otomatis saat dibuka", cfg.auto_check_updates),
     ];
     for (idx, (tog_r, y, title, val)) in rows.into_iter().enumerate() {
-        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 36.0), title, COL_TEXT_SUB);
+        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 30.0), title, COL_TEXT_SUB);
         draw_toggle_switch(rt, brush, tog_r, val, tog_r.contains(hx, hy), false, COL_EMERALD);
-        if idx < 2 {
-            draw_hline(rt, brush, 20.0, 660.0, y + 38.0, c_rgb(24, 24, 29));
+        if idx < 3 {
+            draw_hline(rt, brush, 20.0, 660.0, y + 32.0, c_rgb(24, 24, 29));
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn paint_update_footer(
+    rt: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    d2d: &D2DResources,
+    up_state: &UpdateState,
+    hx: f32,
+    hy: f32,
+    drop_open: Option<DropdownKind>,
+) {
+    let footer_bg = RectF::new(0.0, 646.0, LOGICAL_W, LOGICAL_H - 646.0);
+    brush.SetColor(&c_rgb(12, 12, 15));
+    rt.FillRectangle(&footer_bg.to_d2d(), brush);
+    draw_hline(rt, brush, 0.0, LOGICAL_W, 646.0, COL_DIVIDER);
+
+    let (dot_col, title_txt, title_col, sub_txt, act_label, act_style, act_disabled, dl_ratio) =
+        match up_state {
+            UpdateState::Idle => (
+                COL_TEXT_DIM,
+                format!("NVLiteReplay v{} · GitHub Releases", APP_VERSION),
+                COL_TEXT_SUB,
+                "Repo: xionnx/NVLiteReplay · Portable Windows x64".to_string(),
+                "Periksa Update".to_string(),
+                BtnStyle::Secondary,
+                false,
+                None,
+            ),
+            UpdateState::Checking => (
+                COL_BLUE,
+                format!("NVLiteReplay v{} · Memeriksa GitHub...", APP_VERSION),
+                COL_TEXT,
+                "Menghubungi GitHub Releases API (xionnx/NVLiteReplay)...".to_string(),
+                "Memeriksa...".to_string(),
+                BtnStyle::Secondary,
+                true,
+                None,
+            ),
+            UpdateState::UpToDate { latest_tag, .. } => (
+                COL_EMERALD,
+                format!("NVLiteReplay v{} · Sudah versi terbaru", APP_VERSION),
+                COL_TEXT,
+                format!("Sinkron dengan rilis GitHub {} · xionnx/NVLiteReplay", latest_tag),
+                "Periksa Update".to_string(),
+                BtnStyle::Secondary,
+                false,
+                None,
+            ),
+            UpdateState::Available {
+                latest_tag,
+                release_name,
+                notes_summary,
+                exe_url,
+                exe_size,
+                ..
+            } => {
+                let sub = if !notes_summary.is_empty() {
+                    truncate_tail(&format!("{} — {}", release_name, notes_summary), 62)
+                } else if exe_url.is_some() && *exe_size > 0 {
+                    format!(
+                        "{} siap dipasang otomatis ({:.0} KB)",
+                        release_name,
+                        *exe_size as f64 / 1024.0
+                    )
+                } else {
+                    "Klik Unduh Rilis untuk membuka halaman GitHub Releases".to_string()
+                };
+                let act = if exe_url.is_some() {
+                    format!("Pasang {}", latest_tag)
+                } else {
+                    format!("Unduh {} ↗", latest_tag)
+                };
+                (
+                    COL_EMERALD,
+                    format!("Update {} tersedia! (Terpasang: v{})", latest_tag, APP_VERSION),
+                    COL_EMERALD_HOVER,
+                    sub,
+                    act,
+                    BtnStyle::Primary,
+                    false,
+                    None,
+                )
+            }
+            UpdateState::Downloading {
+                latest_tag,
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                let (pct_str, ratio) = if *total_bytes > 0 {
+                    let r = (*downloaded_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0);
+                    (format!("{:.0}%", r * 100.0), Some(r))
+                } else {
+                    (format!("{:.0} KB", *downloaded_bytes as f64 / 1024.0), Some(0.35))
+                };
+                let sub = if *total_bytes > 0 {
+                    format!(
+                        "Mengunduh binary dari GitHub ({:.0} / {:.0} KB)...",
+                        *downloaded_bytes as f64 / 1024.0,
+                        *total_bytes as f64 / 1024.0
+                    )
+                } else {
+                    "Mengunduh paket pembaruan dari GitHub Releases...".to_string()
+                };
+                (
+                    COL_BLUE,
+                    format!("Mengunduh {} ({})...", latest_tag, pct_str),
+                    COL_TEXT,
+                    sub,
+                    "Mengunduh...".to_string(),
+                    BtnStyle::Secondary,
+                    true,
+                    ratio,
+                )
+            }
+            UpdateState::Installing { latest_tag } | UpdateState::ReadyToRestart { latest_tag } => (
+                COL_EMERALD,
+                format!("Memasang {} & me-restart aplikasi...", latest_tag),
+                COL_EMERALD_HOVER,
+                "Menutup sesi buffer & mengganti executable secara aman...".to_string(),
+                "Memasang...".to_string(),
+                BtnStyle::Secondary,
+                true,
+                Some(1.0),
+            ),
+            UpdateState::Error(err) => (
+                COL_AMBER,
+                format!("NVLiteReplay v{} · Pembaruan terganggu", APP_VERSION),
+                COL_AMBER,
+                truncate_tail(err, 64),
+                "Coba Lagi".to_string(),
+                BtnStyle::Secondary,
+                false,
+                None,
+            ),
+        };
+
+    if let Some(ratio) = dl_ratio {
+        draw_progress_bar(rt, brush, RectF::new(0.0, 646.0, LOGICAL_W, 2.5), ratio, COL_EMERALD);
+    }
+
+    brush.SetColor(&dot_col);
+    rt.FillEllipse(
+        &D2D1_ELLIPSE {
+            point: D2D_POINT_2F { x: 24.0, y: 664.0 },
+            radiusX: 3.0,
+            radiusY: 3.0,
+        },
+        brush,
+    );
+    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(34.0, 655.0, 384.0, 18.0), &title_txt, title_col);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(34.0, 673.0, 384.0, 16.0), &sub_txt, COL_TEXT_MUTED);
+
+    let gh_hov = drop_open.is_none() && R_BTN_GITHUB_PAGE.contains(hx, hy);
+    draw_button(rt, brush, R_BTN_GITHUB_PAGE, 6.0, BtnStyle::Secondary, gh_hov, false);
+    let gh_label = if matches!(up_state, UpdateState::Available { .. }) {
+        "Catatan ↗"
+    } else {
+        "GitHub ↗"
+    };
+    draw_text(rt, brush, &d2d.fmt_center_reg, R_BTN_GITHUB_PAGE, gh_label, COL_TEXT_SUB);
+
+    let act_hov = !act_disabled && drop_open.is_none() && R_BTN_UPDATE_ACTION.contains(hx, hy);
+    draw_button(rt, brush, R_BTN_UPDATE_ACTION, 6.0, act_style, act_hov, act_disabled);
+    let act_fg = if act_disabled {
+        COL_TEXT_DIM
+    } else if matches!(act_style, BtnStyle::Primary) {
+        COL_INK
+    } else {
+        COL_TEXT
+    };
+    draw_text(rt, brush, &d2d.fmt_center_bold, R_BTN_UPDATE_ACTION, &act_label, act_fg);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2672,6 +2872,11 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
     if R_TAB_0.contains(x, y) || R_TAB_1.contains(x, y) || R_TAB_2.contains(x, y) || R_TAB_3.contains(x, y) {
         return HoverCursorKind::Hand;
     }
+    if R_BTN_GITHUB_PAGE.contains(x, y)
+        || (R_BTN_UPDATE_ACTION.contains(x, y) && !state.engine.updater.snapshot().is_busy())
+    {
+        return HoverCursorKind::Hand;
+    }
     match state.active_tab {
         0 => {
             let caps = *state.engine.codec_caps.lock().unwrap();
@@ -2721,6 +2926,7 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
                 || R_TOG_TRAY.contains(x, y)
                 || R_TOG_BEEP.contains(x, y)
                 || R_TOG_FOCUS.contains(x, y)
+                || R_TOG_AUTO_UPDATE.contains(x, y)
             {
                 HoverCursorKind::Hand
             } else {
@@ -2860,6 +3066,32 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
     if R_BTN_FOLDER.contains(x, y) {
         let dir = state.engine.config.lock().unwrap().output_folder.clone();
         open_folder_in_explorer(&dir);
+        return;
+    }
+
+    // 2b. Global GitHub Releases update bar buttons
+    if R_BTN_GITHUB_PAGE.contains(x, y) {
+        cancel_hotkey_capture(state);
+        let up = state.engine.updater.snapshot();
+        open_url_in_browser(up.release_page_url());
+        return;
+    }
+    if R_BTN_UPDATE_ACTION.contains(x, y) {
+        cancel_hotkey_capture(state);
+        let up = state.engine.updater.snapshot();
+        match up {
+            UpdateState::Available { exe_url: Some(_), .. } => {
+                state.engine.updater.install_available_update_async(Arc::clone(&state.engine));
+            }
+            UpdateState::Available { html_url, .. } => {
+                open_url_in_browser(&html_url);
+            }
+            UpdateState::Idle | UpdateState::UpToDate { .. } | UpdateState::Error(_) => {
+                state.engine.updater.check_for_updates_async(true);
+            }
+            _ => {}
+        }
+        let _ = InvalidateRect(state.hwnd, None, false);
         return;
     }
 
@@ -3052,6 +3284,10 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
                 let mut cfg = state.engine.config.lock().unwrap();
                 cfg.suppress_notifications_in_game = !cfg.suppress_notifications_in_game;
                 cfg.save();
+            } else if R_TOG_AUTO_UPDATE.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                cfg.auto_check_updates = !cfg.auto_check_updates;
+                cfg.save();
             }
             let _ = InvalidateRect(state.hwnd, None, false);
         }
@@ -3183,6 +3419,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
                 register_hotkeys(&mut state);
                 ensure_tray_icon(&mut state);
+                let auto_upd = state.engine.config.lock().unwrap().auto_check_updates;
+                if auto_upd {
+                    state.engine.updater.check_for_updates_async(false);
+                }
                 let _ = SetTimer(hwnd, TIMER_UPDATE_ID, 250, None);
                 SetWindowLongPtrW(hwnd, GWL_USERDATA, Box::into_raw(state) as isize);
             }
@@ -3412,6 +3652,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let dir = st.engine.config.lock().unwrap().output_folder.clone();
                         open_folder_in_explorer(&dir);
                     }
+                    ID_TRAY_UPDATE => {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                        let _ = SetForegroundWindow(hwnd);
+                        sync_timer_rate(st);
+                        let snap = st.engine.updater.snapshot();
+                        if !matches!(snap, UpdateState::Available { .. }) && !snap.is_busy() {
+                            st.engine.updater.check_for_updates_async(true);
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                     ID_TRAY_EXIT => {
                         let _ = ShowWindow(hwnd, SW_HIDE);
                         remove_tray_icon(st);
@@ -3453,6 +3703,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_APP_STATUS => {
             let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_APP_UPDATE => {
+            if !ptr.is_null() {
+                let st = &mut *ptr;
+                if wparam.0 == 1 {
+                    cancel_hotkey_capture(st);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    remove_tray_icon(st);
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_APP_VOICE_TRIGGER => {

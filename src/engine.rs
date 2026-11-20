@@ -83,6 +83,7 @@ use crate::voice::VoiceRecognizer;
 pub const WM_APP_STATUS: u32 = 0x8000 + 101;
 pub const WM_APP_SAVED: u32 = 0x8000 + 102;
 pub const WM_APP_VOICE_TRIGGER: u32 = 0x8000 + 103;
+pub const WM_APP_UPDATE: u32 = 0x8000 + 104;
 
 #[derive(Clone, Debug)]
 pub struct DisplayTarget {
@@ -428,6 +429,7 @@ impl Drop for GdiFallbackState {
 pub struct ReplayEngine {
     pub config: Mutex<ReplayConfig>,
     pub voice: Arc<VoiceRecognizer>,
+    pub updater: Arc<crate::updater::UpdateManager>,
     pub displays: Mutex<Vec<DisplayTarget>>,
     pub mic_devices: Mutex<Vec<AudioInputDevice>>,
     pub active_mic_name: Mutex<String>,
@@ -458,6 +460,7 @@ impl ReplayEngine {
         let engine = Arc::new(Self {
             config: Mutex::new(config),
             voice,
+            updater: crate::updater::UpdateManager::new(),
             displays: Mutex::new(Vec::new()),
             mic_devices: Mutex::new(Vec::new()),
             active_mic_name: Mutex::new(String::new()),
@@ -487,6 +490,7 @@ impl ReplayEngine {
         if let Ok(mut guard) = self.ui_hwnd.lock() {
             *guard = hwnd.0 as isize;
         }
+        self.updater.set_ui_hwnd(hwnd);
     }
 
     fn notify_ui_status(&self) {
@@ -538,11 +542,15 @@ impl ReplayEngine {
         true
     }
 
-    fn raise_status(&self, msg: String) {
+    pub fn raise_status(&self, msg: String) {
         if let Ok(mut guard) = self.status_message.lock() {
             *guard = msg;
         }
         self.notify_ui_status();
+    }
+
+    pub fn is_saving(&self) -> bool {
+        self.is_saving.load(Ordering::Acquire)
     }
 
     fn notify_saved(&self, path: String) {

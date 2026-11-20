@@ -5,6 +5,7 @@ mod config;
 mod cursor;
 mod engine;
 mod ui;
+mod updater;
 mod voice;
 
 use std::time::{Duration, Instant};
@@ -336,6 +337,8 @@ fn main() {
         std::process::exit(code);
     }
 
+    let update_notice = updater::handle_update_startup_args(&args);
+
     unsafe {
         let mutex_name = wide_null("Global\\NVLiteReplayRustVoiceRecog_SingleInstance_Mutex");
         let _mutex = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()));
@@ -354,6 +357,9 @@ fn main() {
 
     let cfg = ReplayConfig::load();
     let engine = ReplayEngine::new(cfg);
+    if let Some(msg) = update_notice {
+        engine.raise_status(msg);
+    }
     ui::run(engine);
 
     unsafe {
