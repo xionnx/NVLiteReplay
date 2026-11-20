@@ -2,7 +2,7 @@ use std::fs;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -73,7 +73,10 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, PostMessageW};
 
-use crate::audio::{enumerate_audio_input_devices, AudioInputDevice, WasapiStream};
+use crate::audio::{
+    default_audio_endpoint_id, enumerate_audio_input_devices, AudioEndpointMonitor,
+    AudioInputDevice, WasapiStream,
+};
 use crate::config::{BufferStorageMode, ReplayConfig, VideoCodecType};
 use crate::voice::VoiceRecognizer;
 
@@ -124,19 +127,44 @@ impl DisplayTarget {
     }
 }
 
+static NEXT_SEG_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Reference-counted temp segment file guard.
+/// Keeps evicted Disk Temp Buffer `.mp4` files alive while an async replay merge
+/// still holds a cloned snapshot, and deletes them automatically once dropped.
+#[derive(Debug)]
+pub struct DiskTempFile {
+    pub path: PathBuf,
+}
+
+impl DiskTempFile {
+    pub fn new(path: PathBuf) -> Arc<Self> {
+        Arc::new(Self { path })
+    }
+}
+
+impl Drop for DiskTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 #[derive(Clone)]
 pub struct ReplaySegment {
+    pub seq_id: u64,
     pub ram_data: Option<Vec<u8>>,
-    pub disk_path: Option<PathBuf>,
+    pub disk_file: Option<Arc<DiskTempFile>>,
     pub size_bytes: u64,
     pub duration_seconds: f64,
-    /// Capture order; background finalizers can complete out of order.
-    pub seq: u32,
 }
 
 impl ReplaySegment {
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+
+    pub fn disk_path(&self) -> Option<&Path> {
+        self.disk_file.as_deref().map(|f| f.path.as_path())
     }
 }
 
@@ -172,6 +200,7 @@ impl Drop for ComMfGuard {
 }
 
 struct ActiveSegmentWriter {
+    seq_id: u64,
     sink_writer: IMFSinkWriter,
     mem_stream: Option<IStream>,
     _mf_byte_stream: Option<IMFByteStream>,
@@ -181,9 +210,15 @@ struct ActiveSegmentWriter {
     has_audio: bool,
     frames_written: u32,
     audio_samples_written: i64,
+    write_errors: u32,
     actual_codec: VideoCodecType,
     vbr_tuned: bool,
-    seq: u32,
+}
+
+enum CaptureSessionOutcome {
+    Stopped,
+    NeedsRestart,
+    Fatal(&'static str),
 }
 
 // SAFETY: IMFSinkWriter and IMFDXGIDeviceManager are COM free-threaded/thread-safe
@@ -418,8 +453,8 @@ pub struct ReplayEngine {
     is_stopping: AtomicBool,
     is_saving: AtomicBool,
     force_rotate: AtomicBool,
-    pending_finalize: AtomicUsize,
     rotate_notify: (Mutex<bool>, Condvar),
+    consecutive_seg_failures: AtomicU32,
 
     current_fps_x10: AtomicU64,
     ui_hwnd: Mutex<isize>,
@@ -447,8 +482,8 @@ impl ReplayEngine {
             is_stopping: AtomicBool::new(false),
             is_saving: AtomicBool::new(false),
             force_rotate: AtomicBool::new(false),
-            pending_finalize: AtomicUsize::new(0),
             rotate_notify: (Mutex::new(false), Condvar::new()),
+            consecutive_seg_failures: AtomicU32::new(0),
             current_fps_x10: AtomicU64::new(0),
             ui_hwnd: Mutex::new(0),
             capture_thread: Mutex::new(None),
@@ -464,16 +499,60 @@ impl ReplayEngine {
         }
     }
 
-    fn raise_status(&self, msg: String) {
-        if let Ok(mut guard) = self.status_message.lock() {
-            *guard = msg;
-        }
+    fn notify_ui_status(&self) {
         let raw_hwnd = self.ui_hwnd.lock().map(|g| *g).unwrap_or(0);
         if raw_hwnd != 0 {
             unsafe {
                 let _ = PostMessageW(HWND(raw_hwnd as *mut _), WM_APP_STATUS, WPARAM(0), LPARAM(0));
             }
         }
+    }
+
+    fn sync_active_mic_name(&self, mic_audio: &WasapiStream) {
+        if let Ok(mut g) = self.active_mic_name.lock() {
+            if mic_audio.is_available() {
+                *g = mic_audio.active_device_name().to_string();
+            } else {
+                g.clear();
+            }
+        }
+    }
+
+    fn sync_audio_endpoint(
+        stream: &mut WasapiStream,
+        is_loopback: bool,
+        pinned_device_id: Option<&str>,
+        dirty: bool,
+        retry_interval: Duration,
+        last_retry: &mut Instant,
+    ) -> bool {
+        let invalidated = stream.take_invalidated();
+        let retry_due = !stream.is_available() && last_retry.elapsed() >= retry_interval;
+        if !(dirty || invalidated || retry_due) {
+            return false;
+        }
+
+        let need_reinit = if !stream.is_available() || invalidated {
+            true
+        } else if pinned_device_id.is_none() {
+            default_audio_endpoint_id(is_loopback).as_deref() != Some(stream.active_device_id())
+        } else {
+            false
+        };
+        if !need_reinit {
+            return false;
+        }
+
+        *last_retry = Instant::now();
+        stream.initialize_with_device(is_loopback, pinned_device_id);
+        true
+    }
+
+    fn raise_status(&self, msg: String) {
+        if let Ok(mut guard) = self.status_message.lock() {
+            *guard = msg;
+        }
+        self.notify_ui_status();
     }
 
     fn notify_saved(&self, path: String) {
@@ -600,8 +679,9 @@ impl ReplayEngine {
         if self.is_running.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Leftovers from a run that died on its own (seq/paths restart from scratch).
         self.clear_buffer();
+        self.consecutive_seg_failures.store(0, Ordering::Release);
+        self.force_rotate.store(false, Ordering::Release);
 
         let cfg = self.config.lock().unwrap().clone();
         let mode_str = if cfg.storage_mode == BufferStorageMode::RamRingBuffer {
@@ -631,6 +711,12 @@ impl ReplayEngine {
             }
         }
 
+        // Quit calls stop() and then exits the process; let an in-flight merge finish first.
+        // ponytail: 30s cap so quit can't hang forever on a stuck merge
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.is_saving.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
         self.clear_buffer();
         if let Ok(mut s) = self.capture_mode_status.lock() {
             *s = "Standby".to_string();
@@ -674,26 +760,15 @@ impl ReplayEngine {
         }
     }
 
-    fn wait_for_save(&self) {
-        // ponytail: 30s cap so quit can't hang forever on a stuck merge
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while self.is_saving.load(Ordering::Acquire) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     pub fn clear_buffer(&self) {
-        self.wait_for_save();
         let drained: Vec<ReplaySegment> = if let Ok(mut segs) = self.segments.lock() {
             segs.drain(..).collect()
         } else {
             Vec::new()
         };
-        for seg in drained {
-            if let Some(ref p) = seg.disk_path {
-                let _ = fs::remove_file(p);
-            }
-        }
+        // Dropping `drained` releases each segment's `Arc<DiskTempFile>` outside the mutex;
+        // any file not pinned by an in-flight replay save is deleted immediately.
+        drop(drained);
     }
 
     pub fn save_replay_async(self: &Arc<Self>) {
@@ -715,17 +790,11 @@ impl ReplayEngine {
                 let (lock, cv) = &engine.rotate_notify;
                 if let Ok(mut done) = lock.lock() {
                     *done = false;
+                    engine.force_rotate.store(true, Ordering::Release);
+                    let _ = cv.wait_timeout_while(done, Duration::from_millis(3000), |d| !*d);
+                } else {
+                    engine.force_rotate.store(true, Ordering::Release);
                 }
-                engine.force_rotate.store(true, Ordering::Release);
-                if let Ok(done) = lock.lock() {
-                    let _ = cv.wait_timeout_while(done, Duration::from_millis(1200), |d| !*d);
-                }
-            }
-            // A natural rotation just before the save may still be finalizing the previous
-            // segment in the background; without it the clip has a gap.
-            let fin_deadline = Instant::now() + Duration::from_secs(3);
-            while engine.pending_finalize.load(Ordering::Acquire) > 0 && Instant::now() < fin_deadline {
-                thread::sleep(Duration::from_millis(10));
             }
 
             let cfg = engine.config.lock().unwrap().clone();
@@ -754,17 +823,18 @@ impl ReplayEngine {
             let out_dir = Path::new(&cfg.output_folder);
             let _ = fs::create_dir_all(out_dir);
 
-            let mut file_name = local_replay_filename();
-            let mut n = 2;
-            while out_dir.join(&file_name).exists() {
-                file_name = format!("{}_{}.mp4", local_replay_filename().trim_end_matches(".mp4"), n);
-                n += 1;
-            }
-            let output_path = out_dir.join(&file_name);
+            let output_path = unique_replay_output_path(out_dir);
+            let file_name = output_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Replay.mp4")
+                .to_string();
 
             let t0 = Instant::now();
             let ok = merge_segments_pure_native(&snapshot, &output_path, cfg.fps);
             let elapsed_ms = t0.elapsed().as_millis();
+            // Explicitly drop snapshot after merge so any evicted Arc<DiskTempFile> files clean up now.
+            drop(snapshot);
 
             if ok {
                 if let Ok(meta) = fs::metadata(&output_path) {
@@ -793,19 +863,39 @@ impl ReplayEngine {
         });
     }
 
+    fn record_segment_failure(&self, mode: BufferStorageMode) {
+        self.consecutive_seg_failures.fetch_add(1, Ordering::AcqRel);
+        // If Disk Temp Buffer ran out of space while holding a full 3-5 min ring, evict the
+        // oldest segment so subsequent segments have room instead of deadlocking forever.
+        if mode == BufferStorageMode::DiskTempBuffer {
+            let evicted_old = {
+                if let Ok(mut segs) = self.segments.lock() {
+                    if segs.len() > 2 {
+                        Some(segs.remove(0))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            drop(evicted_old);
+        }
+    }
+
     fn finalize_and_store_segment(
         self: &Arc<Self>,
         mut seg_writer: ActiveSegmentWriter,
         fps: u32,
         mode: BufferStorageMode,
-    ) {
+    ) -> bool {
         if seg_writer.frames_written == 0 {
             let orphaned = seg_writer.disk_path.take();
             drop(seg_writer);
             if let Some(p) = orphaned {
                 let _ = fs::remove_file(p);
             }
-            return;
+            return false;
         }
         unsafe {
             if !self.is_running.load(Ordering::Acquire) {
@@ -814,25 +904,29 @@ impl ReplayEngine {
                 if let Some(p) = orphaned {
                     let _ = fs::remove_file(p);
                 }
-                return;
+                return false;
             }
+            let seq_id = seg_writer.seq_id;
+            let duration = seg_writer.frames_written as f64 / fps.max(1) as f64;
             if seg_writer.sink_writer.Finalize().is_err() {
                 let orphaned = seg_writer.disk_path.take();
                 drop(seg_writer);
                 if let Some(p) = orphaned {
                     let _ = fs::remove_file(p);
                 }
-                return;
+                self.record_segment_failure(mode);
+                return false;
             }
-            let duration = seg_writer.frames_written as f64 / fps.max(1) as f64;
+
             let mut seg = ReplaySegment {
+                seq_id,
                 ram_data: None,
-                disk_path: None,
+                disk_file: None,
                 size_bytes: 0,
                 duration_seconds: duration,
-                seq: seg_writer.seq,
             };
 
+            let disk_path_opt = seg_writer.disk_path.take();
             if mode == BufferStorageMode::RamRingBuffer {
                 if let Some(ref stream) = seg_writer.mem_stream {
                     let mut stat = STATSTG::default();
@@ -849,71 +943,114 @@ impl ReplayEngine {
                         }
                     }
                 }
-            } else if let Some(path) = seg_writer.disk_path.take() {
-                if let Ok(meta) = fs::metadata(&path) {
-                    seg.size_bytes = meta.len();
-                    seg.disk_path = Some(path);
-                }
             }
-            // Drop writer explicitly before pushing/cleaning so MP4 file handles are closed
+            // Drop writer BEFORE checking disk metadata / pushing so MP4 file handles are closed & flushed.
             drop(seg_writer);
 
-            if seg.ram_data.is_some() || seg.disk_path.is_some() {
-                if !self.is_running.load(Ordering::Acquire) {
-                    if let Some(ref p) = seg.disk_path {
-                        let _ = fs::remove_file(p);
-                    }
-                    return;
-                }
-                let (max_dur, cur_mode) = {
-                    let cfg = self.config.lock().unwrap();
-                    (
-                        (cfg.replay_duration_seconds + cfg.segment_duration_seconds) as f64,
-                        cfg.storage_mode,
-                    )
-                };
-                let mut evicted = false;
-                let mut evicted_paths = Vec::new();
-                {
-                    let mut segs = self.segments.lock().unwrap();
-                    if !self.is_running.load(Ordering::Acquire) {
-                        if let Some(p) = seg.disk_path.take() {
-                            evicted_paths.push(p);
+            if mode == BufferStorageMode::DiskTempBuffer {
+                if let Some(path) = disk_path_opt {
+                    match fs::metadata(&path) {
+                        Ok(meta) if meta.len() > 0 => {
+                            seg.size_bytes = meta.len();
+                            seg.disk_file = Some(DiskTempFile::new(path));
                         }
-                    } else {
-                        let pos = segs.partition_point(|s| s.seq < seg.seq);
-                        segs.insert(pos, seg);
-                        while segs.len() > 1 {
-                            let total: f64 = segs.iter().map(|s| s.duration_seconds).sum();
-                            if total <= max_dur {
-                                break;
-                            }
-                            let old = segs.remove(0);
-                            if let Some(p) = old.disk_path {
-                                evicted_paths.push(p);
-                            }
-                            evicted = true;
+                        _ => {
+                            let _ = fs::remove_file(path);
                         }
                     }
-                }
-                for p in evicted_paths {
-                    let _ = fs::remove_file(p);
-                }
-                if evicted && cur_mode == BufferStorageMode::RamRingBuffer {
-                    trim_working_set();
                 }
             }
+
+            if seg.ram_data.is_none() && seg.disk_file.is_none() {
+                self.record_segment_failure(mode);
+                return false;
+            }
+
+            if !self.is_running.load(Ordering::Acquire) {
+                drop(seg);
+                return false;
+            }
+            let (max_dur, cur_mode) = {
+                let cfg = self.config.lock().unwrap();
+                (
+                    (cfg.replay_duration_seconds + cfg.segment_duration_seconds) as f64,
+                    cfg.storage_mode,
+                )
+            };
+            let mut evicted = false;
+            let mut evicted_segs = Vec::new();
+            {
+                let mut segs = self.segments.lock().unwrap();
+                if !self.is_running.load(Ordering::Acquire) {
+                    evicted_segs.push(seg);
+                } else {
+                    let pos = segs.partition_point(|s| s.seq_id < seg.seq_id);
+                    segs.insert(pos, seg);
+                    while segs.len() > 1 {
+                        let total: f64 = segs.iter().map(|s| s.duration_seconds).sum();
+                        if total <= max_dur {
+                            break;
+                        }
+                        evicted_segs.push(segs.remove(0));
+                        evicted = true;
+                    }
+                }
+            }
+            // Drop evicted segments outside the mutex; Arc<DiskTempFile> deletes unpinned files immediately
+            // while keeping files currently being merged by save_replay_async alive until merge completes.
+            drop(evicted_segs);
+            self.consecutive_seg_failures.store(0, Ordering::Release);
+            if evicted && cur_mode == BufferStorageMode::RamRingBuffer {
+                trim_working_set();
+            }
+            true
+        }
+    }
+
+    fn reset_standby_metrics(&self) {
+        self.current_fps_x10.store(0, Ordering::Relaxed);
+        if let Ok(mut s) = self.capture_mode_status.lock() {
+            *s = "Standby".to_string();
+        }
+        if let Ok(mut p) = self.video_pipeline_status.lock() {
+            *p = "Standby".to_string();
         }
     }
 
     fn capture_loop(engine: Arc<Self>) {
+        struct CaptureExitGuard {
+            engine: Arc<ReplayEngine>,
+        }
+        impl Drop for CaptureExitGuard {
+            fn drop(&mut self) {
+                let (lock, cv) = &self.engine.rotate_notify;
+                if let Ok(mut done) = lock.lock() {
+                    *done = true;
+                    cv.notify_all();
+                }
+                // Never leave `is_running == true` after the capture thread exits (prevents
+                // zombie buffer state that would repeatedly save stale clips).
+                if self.engine.is_running.swap(false, Ordering::AcqRel) {
+                    self.engine.reset_standby_metrics();
+                    self.engine.raise_status(
+                        "Error: Capture terhenti (cek ruang disk temp / GPU). Nyalakan ulang Replay."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         let _com_mf_guard = unsafe { ComMfGuard::new(true) };
+        let _exit_guard = CaptureExitGuard {
+            engine: Arc::clone(&engine),
+        };
 
         engine.refresh_displays_and_gpu();
         let displays = engine.displays.lock().unwrap().clone();
         let cfg_init = engine.config.lock().unwrap().clone();
 
         if displays.is_empty() {
+            engine.reset_standby_metrics();
             engine.raise_status("Error: Tidak ada monitor yang terdeteksi.".to_string());
             engine.is_running.store(false, Ordering::Release);
             return;
@@ -922,6 +1059,60 @@ impl ReplayEngine {
         let mon_idx = cfg_init.monitor_index.min(displays.len() - 1);
         let target_mon = displays[mon_idx].clone();
 
+        const MAX_RAPID_RESTARTS: u32 = 3;
+        let mut next_seq_id: u64 = 1;
+        let mut rapid_restarts: u32 = 0;
+
+        while engine.is_running.load(Ordering::Acquire) {
+            let session_start = Instant::now();
+            engine.consecutive_seg_failures.store(0, Ordering::Release);
+
+            match Self::run_capture_session(&engine, &target_mon, &cfg_init, &mut next_seq_id) {
+                CaptureSessionOutcome::Stopped => break,
+                CaptureSessionOutcome::Fatal(msg) => {
+                    engine.reset_standby_metrics();
+                    engine.raise_status(msg.to_string());
+                    engine.is_running.store(false, Ordering::Release);
+                    break;
+                }
+                CaptureSessionOutcome::NeedsRestart => {
+                    if !engine.is_running.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if session_start.elapsed() >= Duration::from_secs(15) {
+                        rapid_restarts = 0;
+                    }
+                    rapid_restarts += 1;
+                    if rapid_restarts > MAX_RAPID_RESTARTS {
+                        engine.reset_standby_metrics();
+                        engine.raise_status(
+                            "Error: Encoder/Disk Temp gagal pulih — cek ruang disk atau GPU."
+                                .to_string(),
+                        );
+                        engine.is_running.store(false, Ordering::Release);
+                        break;
+                    }
+                    engine.raise_status(format!(
+                        "Memulihkan pipeline capture ({}/{})...",
+                        rapid_restarts, MAX_RAPID_RESTARTS
+                    ));
+                    for _ in 0..8 {
+                        if !engine.is_running.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_capture_session(
+        engine: &Arc<Self>,
+        target_mon: &DisplayTarget,
+        cfg_init: &ReplayConfig,
+        next_seq_id: &mut u64,
+    ) -> CaptureSessionOutcome {
         let cap_width = target_mon.width;
         let cap_height = target_mon.height;
         let cap_left = target_mon.left;
@@ -986,9 +1177,7 @@ impl ReplayEngine {
             }
 
             let (Some(device), Some(context)) = (device_opt, context_opt) else {
-                engine.raise_status("Gagal menginisialisasi D3D11 GPU device.".to_string());
-                engine.is_running.store(false, Ordering::Release);
-                return;
+                return CaptureSessionOutcome::Fatal("Gagal menginisialisasi D3D11 GPU device.");
             };
 
             if let Ok(mt) = device.cast::<ID3D11Multithread>() {
@@ -1030,28 +1219,24 @@ impl ReplayEngine {
 
             let want_audio = cfg_init.record_desktop_audio || cfg_init.record_microphone;
             let cfg_mic_id = cfg_init.effective_mic_device_id().map(str::to_string);
+            let audio_monitor = AudioEndpointMonitor::new();
             let mut desktop_audio = WasapiStream::new();
             let mut mic_audio = WasapiStream::new();
             if cfg_init.record_desktop_audio {
-                desktop_audio.initialize(true);
+                desktop_audio.initialize_with_device(true, None);
             }
             if cfg_init.record_microphone || cfg_init.voice_trigger_enabled {
-                if mic_audio.initialize_with_device(false, cfg_mic_id.as_deref()) {
-                    if let Ok(mut g) = engine.active_mic_name.lock() {
-                        *g = mic_audio.active_device_name().to_string();
-                    }
-                } else if let Ok(mut g) = engine.active_mic_name.lock() {
-                    g.clear();
-                }
+                mic_audio.initialize_with_device(false, cfg_mic_id.as_deref());
+                engine.sync_active_mic_name(&mic_audio);
                 if cfg_init.voice_trigger_enabled && mic_audio.is_available() {
                     mic_audio.set_voice_tap_enabled(true);
                 }
             } else if let Ok(mut g) = engine.active_mic_name.lock() {
                 g.clear();
             }
-            let audio_active = want_audio
-                && ((cfg_init.record_desktop_audio && desktop_audio.is_available())
-                    || (cfg_init.record_microphone && mic_audio.is_available()));
+            // Keep audio track active when user enabled audio recording so plugging in or switching
+            // speakers/headphones mid-session resumes sound seamlessly on the same AAC track.
+            let audio_active = want_audio;
 
             // Try ultra-low-VRAM GPU NV12 pipeline first (1 BGRA comp canvas + 4 compact NV12 targets + D3D11 VideoProcessor).
             const RING_SLOTS: usize = 4;
@@ -1064,8 +1249,6 @@ impl ReplayEngine {
             let mut nv12_conv: Option<GpuNv12Converter> = None;
             let mut use_nv12 = false;
 
-            let mut seg_counter: u32 = 1;
-            let mut active_seq: u32 = 0;
             let mut active_writer: Option<ActiveSegmentWriter> = None;
 
             {
@@ -1138,7 +1321,6 @@ impl ReplayEngine {
                                 codec,
                                 true,
                                 true,
-                                seg_counter,
                             ) {
                                 comp_bgra_tex = Some(ctex);
                                 comp_bgra_rtv = Some(crtv);
@@ -1176,9 +1358,7 @@ impl ReplayEngine {
                     }
                 }
                 if gpu_tex_ring.len() < RING_SLOTS {
-                    engine.raise_status("Gagal membuat GPU texture ring.".to_string());
-                    engine.is_running.store(false, Ordering::Release);
-                    return;
+                    return CaptureSessionOutcome::Fatal("Gagal membuat GPU texture ring.");
                 }
                 active_writer = create_segment_writer(
                     dev_mgr_opt.as_ref(),
@@ -1194,15 +1374,14 @@ impl ReplayEngine {
                     codec,
                     false,
                     true,
-                    seg_counter,
                 );
             }
 
-            let Some(first_writer) = active_writer else {
-                engine.raise_status("Gagal menginisialisasi hardware video encoder.".to_string());
-                engine.is_running.store(false, Ordering::Release);
-                return;
+            let Some(mut first_writer) = active_writer else {
+                return CaptureSessionOutcome::Fatal("Gagal menginisialisasi hardware video encoder.");
             };
+            first_writer.seq_id = *next_seq_id;
+            *next_seq_id += 1;
             let active_codec = first_writer.actual_codec;
             let vbr_tuned = first_writer.vbr_tuned;
             let writer_in_w = if use_nv12 { safe_out_w } else { cap_width };
@@ -1215,7 +1394,9 @@ impl ReplayEngine {
             let standby_slot: Arc<Mutex<(bool, Option<ActiveSegmentWriter>)>> =
                 Arc::new(Mutex::new((false, None)));
             let mut prewarm_handle: Option<JoinHandle<()>> = None;
+            let mut prewarm_attempted = false;
             let mut finalizer_handles: Vec<JoinHandle<()>> = Vec::new();
+            let mut outcome = CaptureSessionOutcome::Stopped;
 
             if let Ok(mut g) = engine.gpu_name.lock() {
                 *g = format!("{} ({})", target_mon.adapter_name, target_mon.vendor_tag);
@@ -1266,6 +1447,7 @@ impl ReplayEngine {
             let mut mixed_floats = vec![0.0f32; AUDIO_CHUNK_FLOATS];
             let mut mixed_bytes = vec![0u8; AUDIO_CHUNK_FLOATS * 2];
             let mut voice_mono_buf: Vec<f32> = Vec::with_capacity(2048);
+            let mut last_desk_retry = Instant::now() - Duration::from_secs(10);
             let mut last_mic_retry = Instant::now() - Duration::from_secs(10);
 
             while engine.is_running.load(Ordering::Acquire) {
@@ -1279,17 +1461,22 @@ impl ReplayEngine {
                     while loop_clock.elapsed().as_secs_f64() * 1000.0 < target_ms {
                         std::hint::spin_loop();
                     }
+                    next_frame_tick += 1;
+                } else if now_ms > target_ms + 250.0 {
+                    // Resync frame pacing after disk stalls, sleep/wake, or game load screens
+                    // so we don't burst-encode hundreds of duplicate frames.
+                    next_frame_tick = (now_ms / frame_interval_ms).floor() as u64 + 1;
+                } else {
+                    next_frame_tick += 1;
                 }
-                next_frame_tick += 1;
 
-                // Pre-warm next standby segment writer 1 second before rotation
+                // Pre-warm next standby segment writer once, 1 second before rotation
                 let aw_frames = active_writer.as_ref().map(|w| w.frames_written).unwrap_or(0);
-                if aw_frames + fps >= frames_per_segment {
+                if !prewarm_attempted && aw_frames + fps >= frames_per_segment {
+                    prewarm_attempted = true;
                     let mut st_guard = standby_slot.lock().unwrap();
                     if !st_guard.0 && st_guard.1.is_none() {
                         st_guard.0 = true;
-                        seg_counter += 1;
-                        let next_id = seg_counter;
                         let slot_clone = Arc::clone(&standby_slot);
                         let mgr_wrapped = SendDevMgr(dev_mgr_opt.clone());
                         let temp_dir_pw = temp_dir.clone();
@@ -1319,11 +1506,14 @@ impl ReplayEngine {
                                     active_codec,
                                     use_nv12,
                                     true,
-                                    next_id,
                                 );
                                 if let Ok(mut g) = slot_clone.lock() {
-                                    g.1 = built;
+                                    if let Some(old_w) = std::mem::replace(&mut g.1, built) {
+                                        discard_segment_writer(old_w);
+                                    }
                                     g.0 = false;
+                                } else if let Some(w) = built {
+                                    discard_segment_writer(w);
                                 }
                             })
                             .ok();
@@ -1549,21 +1739,28 @@ impl ReplayEngine {
                 }
 
                 let Some(aw) = active_writer.as_mut() else {
+                    outcome = CaptureSessionOutcome::NeedsRestart;
                     break;
                 };
 
-                // 2. Write Video Sample
+                // 2. Write Video Sample (track consecutive errors so broken GPU/disk streams self-heal)
                 if let Ok(sample) = MFCreateSample() {
                     let sample_time = aw.frames_written as i64 * frame_dur_hns;
                     let _ = sample.SetSampleTime(sample_time);
                     let _ = sample.SetSampleDuration(frame_dur_hns);
                     let _ = sample.AddBuffer(&dxgi_buf_ring[ring_slot]);
-                    let _ = aw
+                    match aw
                         .sink_writer
-                        .WriteSample(aw.video_stream_index, &sample);
+                        .WriteSample(aw.video_stream_index, &sample)
+                    {
+                        Ok(()) => aw.write_errors = 0,
+                        Err(_) => aw.write_errors = aw.write_errors.saturating_add(1),
+                    }
+                } else {
+                    aw.write_errors = aw.write_errors.saturating_add(1);
                 }
 
-                // 3. Drain & Write Audio Chunks + Voice Recognition Tap
+                // 3. Drain & Write Audio Chunks + Voice Recognition Tap (with zero-poll endpoint hot-swap)
                 let (live_voice_enabled, live_voice_sens, live_voice_cd) = {
                     let live_cfg = engine.config.lock().unwrap();
                     (
@@ -1574,16 +1771,36 @@ impl ReplayEngine {
                 };
                 let voice_enrolling = engine.voice.is_enrolling();
                 let voice_want_mic = live_voice_enabled || voice_enrolling;
-                if voice_want_mic
-                    && !mic_audio.is_available()
-                    && last_mic_retry.elapsed() >= Duration::from_secs(3)
-                {
-                    if mic_audio.initialize_with_device(false, cfg_mic_id.as_deref()) {
-                        if let Ok(mut g) = engine.active_mic_name.lock() {
-                            *g = mic_audio.active_device_name().to_string();
-                        }
+
+                let render_dirty = audio_monitor.take_render_dirty();
+                if cfg_init.record_desktop_audio {
+                    Self::sync_audio_endpoint(
+                        &mut desktop_audio,
+                        true,
+                        None,
+                        render_dirty,
+                        Duration::from_millis(400),
+                        &mut last_desk_retry,
+                    );
+                }
+
+                let cap_dirty = audio_monitor.take_capture_dirty();
+                if cap_dirty {
+                    engine.refresh_audio_inputs();
+                    engine.notify_ui_status();
+                }
+                if cfg_init.record_microphone || voice_want_mic {
+                    if Self::sync_audio_endpoint(
+                        &mut mic_audio,
+                        false,
+                        cfg_mic_id.as_deref(),
+                        cap_dirty,
+                        Duration::from_secs(1),
+                        &mut last_mic_retry,
+                    ) {
+                        engine.sync_active_mic_name(&mic_audio);
+                        engine.notify_ui_status();
                     }
-                    last_mic_retry = Instant::now();
                 }
                 mic_audio.set_voice_tap_enabled(voice_want_mic && mic_audio.is_available());
 
@@ -1611,7 +1828,14 @@ impl ReplayEngine {
                         )
                     };
 
-                    loop {
+                    // Guard against clock jump after sleep/stall and cap per-frame iterations so
+                    // audio writing can never hang `capture_loop` even if Media Foundation errors.
+                    let expected_now =
+                        (seg_audio_clock.elapsed().as_secs_f64() * 48_000.0) as i64;
+                    if expected_now - aw.audio_samples_written > 48_000 {
+                        aw.audio_samples_written = expected_now - AUDIO_CHUNK_FRAMES as i64;
+                    }
+                    for _ in 0..16 {
                         let expected_audio_frames =
                             (seg_audio_clock.elapsed().as_secs_f64() * 48_000.0) as i64;
                         if expected_audio_frames - aw.audio_samples_written
@@ -1639,6 +1863,10 @@ impl ReplayEngine {
                             mixed_bytes[idx * 2 + 1] = bytes[1];
                         }
 
+                        let atime = (aw.audio_samples_written * 10_000_000) / 48_000;
+                        let adur = (AUDIO_CHUNK_FRAMES as i64 * 10_000_000) / 48_000;
+                        aw.audio_samples_written += AUDIO_CHUNK_FRAMES as i64;
+
                         if let Ok(abuf) = MFCreateMemoryBuffer(mixed_bytes.len() as u32) {
                             let mut dst_ptr = null_mut();
                             if abuf.Lock(&mut dst_ptr, None, None).is_ok() && !dst_ptr.is_null() {
@@ -1651,16 +1879,16 @@ impl ReplayEngine {
                                 let _ = abuf.SetCurrentLength(mixed_bytes.len() as u32);
 
                                 if let Ok(asample) = MFCreateSample() {
-                                    let atime =
-                                        (aw.audio_samples_written * 10_000_000) / 48_000;
-                                    let adur = (AUDIO_CHUNK_FRAMES as i64 * 10_000_000) / 48_000;
                                     let _ = asample.SetSampleTime(atime);
                                     let _ = asample.SetSampleDuration(adur);
                                     let _ = asample.AddBuffer(&abuf);
-                                    let _ = aw
+                                    if aw
                                         .sink_writer
-                                        .WriteSample(aw.audio_stream_index, &asample);
-                                    aw.audio_samples_written += AUDIO_CHUNK_FRAMES as i64;
+                                        .WriteSample(aw.audio_stream_index, &asample)
+                                        .is_err()
+                                    {
+                                        aw.write_errors = aw.write_errors.saturating_add(1);
+                                    }
                                 }
                             }
                         }
@@ -1703,28 +1931,96 @@ impl ReplayEngine {
                     fps_timer = Instant::now();
                 }
 
-                // 4. Segment Rotation
+                // 4. Segment Rotation + Self-Healing Error Detection
+                let device_lost = aw.write_errors >= 5 && device.GetDeviceRemovedReason().is_err();
+                let broken_pipeline = device_lost
+                    || aw.write_errors >= 10
+                    || engine.consecutive_seg_failures.load(Ordering::Acquire) >= 3;
+                if broken_pipeline {
+                    outcome = CaptureSessionOutcome::NeedsRestart;
+                    break;
+                }
+
                 let forced = engine.force_rotate.load(Ordering::Acquire);
                 if cur_aw_frames >= frames_per_segment || (forced && cur_aw_frames >= 10) {
                     let was_forced = engine.force_rotate.swap(false, Ordering::AcqRel);
                     let Some(finished) = active_writer.take() else {
+                        outcome = CaptureSessionOutcome::NeedsRestart;
                         break;
                     };
 
+                    // Always finish any in-flight prewarm before checking standby_slot so we never
+                    // double-allocate encoder sessions or strand an open writer in standby_slot.
                     if let Some(h) = prewarm_handle.take() {
-                        if h.is_finished() {
-                            let _ = h.join();
-                        } else {
-                            finalizer_handles.push(h);
-                        }
+                        let _ = h.join();
+                    }
+                    let mut prewarmed = standby_slot.lock().ok().and_then(|mut g| g.1.take());
+                    prewarm_attempted = false;
+
+                    // Reap completed background finalizers and bound backlog on slow Disk Temp drives.
+                    while let Some(pos) = finalizer_handles.iter().position(|h| h.is_finished()) {
+                        let _ = finalizer_handles.remove(pos).join();
+                    }
+                    while finalizer_handles.len() >= 2 {
+                        let _ = finalizer_handles.remove(0).join();
                     }
 
-                    let prewarmed = standby_slot.lock().ok().and_then(|mut g| g.1.take());
-                    active_writer = if let Some(w) = prewarmed {
+                    let next_w = if was_forced {
+                        // Drain prior finalizers & finalize current segment FIRST so its encoder
+                        // session and disk file handle are released before any fallback writer is
+                        // created, and `save_replay_async` sees all segments up to this instant.
+                        for h in finalizer_handles.drain(..) {
+                            let _ = h.join();
+                        }
+                        let _ = engine.finalize_and_store_segment(finished, fps, storage_mode);
+                        let (lock, cv) = &engine.rotate_notify;
+                        if let Ok(mut done) = lock.lock() {
+                            *done = true;
+                            cv.notify_all();
+                        }
+                        prewarmed.take().or_else(|| {
+                            try_create_segment_writer_with_retry(
+                                dev_mgr_opt.as_ref(),
+                                writer_in_w,
+                                writer_in_h,
+                                safe_out_w,
+                                safe_out_h,
+                                fps,
+                                bitrate_bps,
+                                audio_active,
+                                storage_mode,
+                                &temp_dir,
+                                active_codec,
+                                use_nv12,
+                            )
+                        })
+                    } else if let Some(w) = prewarmed.take() {
+                        // Fast zero-stall swap: finalize old segment asynchronously in background.
+                        let fin_box = Arc::new(Mutex::new(Some(finished)));
+                        let fin_bg = Arc::clone(&fin_box);
+                        let eng_bg = Arc::clone(engine);
+                        if let Ok(jh) = thread::Builder::new()
+                            .name("NVLiteReplayRust_FinalizeSeg".to_string())
+                            .spawn(move || {
+                                let _mf_guard = ComMfGuard::new(false);
+                                if let Some(fw) = fin_bg.lock().ok().and_then(|mut g| g.take()) {
+                                    let _ = eng_bg.finalize_and_store_segment(fw, fps, storage_mode);
+                                }
+                            })
+                        {
+                            finalizer_handles.push(jh);
+                        } else if let Some(fw) = fin_box.lock().ok().and_then(|mut g| g.take()) {
+                            let _ = engine.finalize_and_store_segment(fw, fps, storage_mode);
+                        }
                         Some(w)
                     } else {
-                        seg_counter += 1;
-                        let Some(fallback_w) = create_segment_writer(
+                        // Standby writer unavailable: release `finished` + backlog FIRST to free
+                        // encoder sessions & disk handles, then retry creating the next writer.
+                        for h in finalizer_handles.drain(..) {
+                            let _ = h.join();
+                        }
+                        let _ = engine.finalize_and_store_segment(finished, fps, storage_mode);
+                        try_create_segment_writer_with_retry(
                             dev_mgr_opt.as_ref(),
                             writer_in_w,
                             writer_in_h,
@@ -1737,49 +2033,22 @@ impl ReplayEngine {
                             &temp_dir,
                             active_codec,
                             use_nv12,
-                            true,
-                            seg_counter,
-                        ) else {
-                            discard_segment_writer(finished);
-                            break;
-                        };
-                        Some(fallback_w)
+                        )
                     };
-                    active_seq += 1;
-                    if let Some(w) = active_writer.as_mut() {
-                        w.seq = active_seq;
-                    }
-                    seg_audio_clock = Instant::now();
 
-                    finalizer_handles.retain(|h| !h.is_finished());
-                    if was_forced {
-                        engine.finalize_and_store_segment(finished, fps, storage_mode);
-                        let (lock, cv) = &engine.rotate_notify;
-                        if let Ok(mut done) = lock.lock() {
-                            *done = true;
-                            cv.notify_all();
-                        }
-                    } else {
-                        let eng_bg = Arc::clone(&engine);
-                        engine.pending_finalize.fetch_add(1, Ordering::AcqRel);
-                        match thread::Builder::new()
-                            .name("NVLiteReplayRust_FinalizeSeg".to_string())
-                            .spawn(move || {
-                                let _mf_guard = ComMfGuard::new(false);
-                                eng_bg.finalize_and_store_segment(finished, fps, storage_mode);
-                                eng_bg.pending_finalize.fetch_sub(1, Ordering::AcqRel);
-                            }) {
-                            Ok(jh) => finalizer_handles.push(jh),
-                            Err(_) => {
-                                engine.pending_finalize.fetch_sub(1, Ordering::AcqRel);
-                            }
-                        }
-                    }
+                    let Some(mut next_w) = next_w else {
+                        outcome = CaptureSessionOutcome::NeedsRestart;
+                        break;
+                    };
+                    next_w.seq_id = *next_seq_id;
+                    *next_seq_id += 1;
+                    active_writer = Some(next_w);
+                    seg_audio_clock = Instant::now();
                 }
             }
 
             // Clean up in-flight writers, prewarm thread, and background finalizers BEFORE
-            // `_com_mf_guard` tears down Media Foundation and COM!
+            // tearing down D3D11/Media Foundation/COM!
             {
                 let (lock, cv) = &engine.rotate_notify;
                 if let Ok(mut done) = lock.lock() {
@@ -1801,13 +2070,7 @@ impl ReplayEngine {
             for h in finalizer_handles.drain(..) {
                 let _ = h.join();
             }
-            // Loop exited on its own (writer creation failed): don't keep reporting "running"
-            // while saves export a frozen buffer.
-            if engine.is_running.swap(false, Ordering::AcqRel) {
-                engine.raise_status(
-                    "Error: perekaman berhenti (encoder gagal). Nyalakan ulang Replay.".to_string(),
-                );
-            }
+            outcome
         }
     }
 }
@@ -2005,6 +2268,46 @@ unsafe fn configure_encoder_codec_api(
 }
 
 #[allow(clippy::too_many_arguments)]
+unsafe fn try_create_segment_writer_with_retry(
+    dev_mgr: Option<&IMFDXGIDeviceManager>,
+    input_w: u32,
+    input_h: u32,
+    out_w: u32,
+    out_h: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    enable_audio: bool,
+    mode: BufferStorageMode,
+    temp_dir: &Path,
+    codec: VideoCodecType,
+    use_nv12: bool,
+) -> Option<ActiveSegmentWriter> {
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(80 * attempt as u64));
+        }
+        if let Some(w) = create_segment_writer(
+            dev_mgr,
+            input_w,
+            input_h,
+            out_w,
+            out_h,
+            fps,
+            bitrate_bps,
+            enable_audio,
+            mode,
+            temp_dir,
+            codec,
+            use_nv12,
+            true,
+        ) {
+            return Some(w);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_segment_writer(
     dev_mgr: Option<&IMFDXGIDeviceManager>,
     input_w: u32,
@@ -2019,7 +2322,6 @@ unsafe fn create_segment_writer(
     codec: VideoCodecType,
     use_nv12: bool,
     force_profile: bool,
-    seg_counter: u32,
 ) -> Option<ActiveSegmentWriter> {
     let safe_out_w = (out_w & !1).max(640);
     let safe_out_h = (out_h & !1).max(360);
@@ -2046,16 +2348,32 @@ unsafe fn create_segment_writer(
         mf_byte_stream = Some(bs);
         sw
     } else {
+        let default_dir = std::env::temp_dir().join("NVLiteReplayRust");
         let mut chosen_dir = temp_dir.to_path_buf();
         if fs::create_dir_all(&chosen_dir).is_err() {
-            chosen_dir = std::env::temp_dir().join("NVLiteReplayRust");
+            chosen_dir = default_dir.clone();
             let _ = fs::create_dir_all(&chosen_dir);
         }
-        let p = chosen_dir.join(format!("seg_{}_{}.mp4", std::process::id(), seg_counter));
+        let seg_file_id = NEXT_SEG_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let p = chosen_dir.join(format!("seg_{}_{}.mp4", std::process::id(), seg_file_id));
         let url = HSTRING::from(p.to_string_lossy().as_ref());
-        let sw = MFCreateSinkWriterFromURL(&url, None, &sw_attrs).ok()?;
-        disk_path = Some(p);
-        sw
+        match MFCreateSinkWriterFromURL(&url, None, &sw_attrs) {
+            Ok(sw) => {
+                disk_path = Some(p);
+                sw
+            }
+            Err(_) if chosen_dir != default_dir => {
+                // Custom temp folder may be read-only / full / disconnected; fall back to default temp.
+                let _ = fs::create_dir_all(&default_dir);
+                let fb_id = NEXT_SEG_FILE_ID.fetch_add(1, Ordering::Relaxed);
+                let fb_p = default_dir.join(format!("seg_{}_{}.mp4", std::process::id(), fb_id));
+                let fb_url = HSTRING::from(fb_p.to_string_lossy().as_ref());
+                let sw = MFCreateSinkWriterFromURL(&fb_url, None, &sw_attrs).ok()?;
+                disk_path = Some(fb_p);
+                sw
+            }
+            Err(_) => return None,
+        }
     };
 
     let out_frame_size = ((safe_out_w as u64) << 32) | (safe_out_h as u64);
@@ -2123,7 +2441,6 @@ unsafe fn create_segment_writer(
                     fb_codec,
                     use_nv12,
                     fb_prof,
-                    seg_counter,
                 );
             }
             return None;
@@ -2165,7 +2482,6 @@ unsafe fn create_segment_writer(
                 fb_codec,
                 use_nv12,
                 fb_prof,
-                seg_counter,
             );
         }
         if !use_nv12 && dev_mgr.is_some() {
@@ -2183,7 +2499,6 @@ unsafe fn create_segment_writer(
                 VideoCodecType::HardwareH264,
                 false,
                 false,
-                seg_counter,
             );
         }
         return None;
@@ -2231,6 +2546,7 @@ unsafe fn create_segment_writer(
     }
 
     Some(ActiveSegmentWriter {
+        seq_id: 0,
         sink_writer,
         mem_stream,
         _mf_byte_stream: mf_byte_stream,
@@ -2240,9 +2556,9 @@ unsafe fn create_segment_writer(
         has_audio,
         frames_written: 0,
         audio_samples_written: 0,
+        write_errors: 0,
         actual_codec: codec,
         vbr_tuned,
-        seq: 0,
     })
 }
 
@@ -2360,7 +2676,7 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
         if let Some(ref ram) = seg.ram_data {
             return fs::write(output_path, ram).is_ok();
         }
-        if let Some(ref p) = seg.disk_path {
+        if let Some(p) = seg.disk_path() {
             return fs::copy(p, output_path).is_ok();
         }
         return false;
@@ -2387,7 +2703,7 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
                 } else {
                     None
                 }
-            } else if let Some(ref p) = seg.disk_path {
+            } else if let Some(p) = seg.disk_path() {
                 let url = HSTRING::from(p.to_string_lossy().as_ref());
                 MFCreateSourceReaderFromURL(&url, None).ok()
             } else {
@@ -2501,9 +2817,10 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
                     if convert_nalu_annex_b {
                         convert_sample_length_prefix_to_annex_b(&sample);
                     }
+                    let dur = sample.GetSampleDuration().unwrap_or(frame_step_hns).max(1);
                     let _ = sample.SetSampleTime(video_time_offset + timestamp);
-                    if timestamp + frame_step_hns > max_video_end {
-                        max_video_end = timestamp + frame_step_hns;
+                    if timestamp + dur > max_video_end {
+                        max_video_end = timestamp + dur;
                     }
                     let _ = sw.WriteSample(out_video_stream, &sample);
                 }
@@ -2532,9 +2849,10 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
                         break;
                     }
                     if let Some(sample) = sample_opt {
+                        let dur = sample.GetSampleDuration().unwrap_or(213_333).max(1);
                         let _ = sample.SetSampleTime(audio_time_offset + timestamp);
-                        if timestamp + 200_000 > max_audio_end {
-                            max_audio_end = timestamp + 200_000;
+                        if timestamp + dur > max_audio_end {
+                            max_audio_end = timestamp + dur;
                         }
                         let _ = sw.WriteSample(out_audio_stream, &sample);
                     }
@@ -2607,14 +2925,25 @@ pub fn inspect_mp4_video_info(path: &Path) -> Option<(String, u32, u32, u32, u32
     }
 }
 
-fn local_replay_filename() -> String {
-    unsafe {
+fn unique_replay_output_path(out_dir: &Path) -> PathBuf {
+    let base = unsafe {
         let st = GetLocalTime();
         format!(
-            "Replay_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.mp4",
+            "Replay_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
         )
+    };
+    let first = out_dir.join(format!("{}.mp4", base));
+    if !first.exists() {
+        return first;
     }
+    for n in 2..=999u32 {
+        let cand = out_dir.join(format!("{}_{}.mp4", base, n));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    first
 }
 
 fn trim_working_set() {
@@ -2726,5 +3055,218 @@ mod tests {
         // Already Annex-B must pass through unchanged
         let already = vec![0, 0, 0, 1, 0x40, 0x01];
         assert_eq!(convert_hvcc_to_annex_b(&already), already);
+    }
+
+    #[test]
+    fn disk_temp_pinned_arc_survives_eviction_during_merge() {
+        let tmp = std::env::temp_dir().join("NVLiteReplayRust_PinnedEvictTest");
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::create_dir_all(&tmp);
+        let p = tmp.join("seg_pinned.mp4");
+        fs::write(&p, b"synthetic_mp4_payload").unwrap();
+
+        let seg = ReplaySegment {
+            seq_id: 1,
+            ram_data: None,
+            disk_file: Some(DiskTempFile::new(p.clone())),
+            size_bytes: 21,
+            duration_seconds: 5.0,
+        };
+        let mut ring = vec![seg];
+        // Simulate save_replay_async snapshotting segments before merge
+        let snapshot = ring.clone();
+        // Simulate ring eviction during a long 3-minute Disk Temp merge
+        ring.clear();
+        assert!(p.exists(), "Evicted file must remain on disk while merge snapshot is alive");
+        // Drop snapshot after merge completes -> RAII DiskTempFile deletes file automatically
+        drop(snapshot);
+        assert!(!p.exists(), "Evicted file must be deleted once merge snapshot drops");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn disk_temp_buffer_full_rollover_never_repeats_clips() {
+        let mut cfg = ReplayConfig::default();
+        cfg.storage_mode = BufferStorageMode::DiskTempBuffer;
+        cfg.codec = VideoCodecType::HardwareH264;
+        cfg.fps = 60;
+        cfg.replay_duration_seconds = 4;
+        cfg.segment_duration_seconds = 1;
+        cfg.bitrate_mbps = 8;
+        cfg.play_sound_on_save = false;
+
+        let tmp = std::env::temp_dir().join("NVLiteReplayRust_DiskRolloverTest");
+        let out_dir = tmp.join("out");
+        let seg_dir = tmp.join("temp");
+        let _ = fs::remove_dir_all(&tmp);
+        cfg.output_folder = out_dir.to_string_lossy().to_string();
+        cfg.temp_folder = seg_dir.to_string_lossy().to_string();
+
+        let engine = ReplayEngine::new(cfg);
+        engine.start();
+
+        // Wait past full replay duration (4s) -> Clip #1
+        std::thread::sleep(Duration::from_millis(5200));
+        engine.save_replay_async();
+        let t0 = Instant::now();
+        while engine.is_saving.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let clip1_path = engine.last_saved_file.lock().unwrap().clone();
+        let clip1_seqs: Vec<u64> = engine
+            .segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.seq_id)
+            .collect();
+
+        // Wait past ANOTHER full replay duration (4s + margin) -> Clip #2 must use 100% newer segments
+        std::thread::sleep(Duration::from_millis(5600));
+        engine.save_replay_async();
+        let t1 = Instant::now();
+        while engine.is_saving.load(Ordering::Acquire) && t1.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let clip2_path = engine.last_saved_file.lock().unwrap().clone();
+        let clip2_seqs: Vec<u64> = engine
+            .segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.seq_id)
+            .collect();
+
+        assert!(engine.is_running(), "Engine must remain active across repeated saves");
+        assert!(!clip1_path.is_empty() && !clip2_path.is_empty());
+        assert_ne!(clip1_path, clip2_path, "Two saves must create distinct MP4 files");
+        assert!(!clip1_seqs.is_empty() && !clip2_seqs.is_empty());
+        assert!(
+            clip1_seqs.windows(2).all(|w| w[0] < w[1]),
+            "Clip 1 segments must stay strictly chronological: {:?}",
+            clip1_seqs
+        );
+        assert!(
+            clip2_seqs.windows(2).all(|w| w[0] < w[1]),
+            "Clip 2 segments must stay strictly chronological: {:?}",
+            clip2_seqs
+        );
+        let max_clip1 = *clip1_seqs.iter().max().unwrap();
+        let min_clip2 = *clip2_seqs.iter().min().unwrap();
+        assert!(
+            min_clip2 > max_clip1,
+            "After waiting > full replay duration, old segments must be evicted (clip1={:?}, clip2={:?})",
+            clip1_seqs,
+            clip2_seqs
+        );
+
+        let info1 = inspect_mp4_video_info(Path::new(&clip1_path)).expect("Clip 1 readable");
+        let info2 = inspect_mp4_video_info(Path::new(&clip2_path)).expect("Clip 2 readable");
+        assert!(info1.4 > 60 && info2.4 > 60, "Both clips must contain valid video frames");
+
+        engine.stop();
+        let pid_prefix = format!("seg_{}_", std::process::id());
+        let leftovers: Vec<String> = fs::read_dir(&seg_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.starts_with(&pid_prefix))
+            .collect();
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(leftovers.is_empty(), "No temp segment files should remain: {:?}", leftovers);
+    }
+
+    #[test]
+    fn disk_temp_36_segments_3min_equiv_merge() {
+        let tmp = std::env::temp_dir().join("NVLiteReplayRust_36SegMergeTest");
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::create_dir_all(&tmp);
+
+        let mut segs36 = Vec::new();
+        unsafe {
+            let _com = ComMfGuard::new(false);
+            let mut dev_opt: Option<ID3D11Device> = None;
+            let mut ctx_opt: Option<ID3D11DeviceContext> = None;
+            let levels = [D3D_FEATURE_LEVEL_11_0];
+            let _ = D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&levels),
+                D3D11_SDK_VERSION,
+                Some(&mut dev_opt),
+                None,
+                Some(&mut ctx_opt),
+            );
+            let dev = dev_opt.expect("D3D11 device");
+            let mut token = 0u32;
+            let mut mgr_opt: Option<IMFDXGIDeviceManager> = None;
+            let _ = MFCreateDXGIDeviceManager(&mut token, &mut mgr_opt);
+            if let Some(ref mgr) = mgr_opt {
+                let _ = mgr.ResetDevice(&dev, token);
+            }
+            let nv12_desc = D3D11_TEXTURE2D_DESC {
+                Width: 1280,
+                Height: 720,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut nt: Option<ID3D11Texture2D> = None;
+            let _ = dev.CreateTexture2D(&nv12_desc, None, Some(&mut nt));
+            let buf = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, nt.as_ref().unwrap(), 0, false).unwrap();
+            let _ = buf.SetCurrentLength(1280 * 720 * 3 / 2);
+
+            for i in 1..=36u64 {
+                let mut wr = create_segment_writer(
+                    mgr_opt.as_ref(),
+                    1280,
+                    720,
+                    1280,
+                    720,
+                    60,
+                    8_000_000,
+                    false,
+                    BufferStorageMode::DiskTempBuffer,
+                    &tmp,
+                    VideoCodecType::HardwareH264,
+                    true,
+                    true,
+                )
+                .expect("create writer");
+                for f in 0..30u32 {
+                    let sample = MFCreateSample().unwrap();
+                    let _ = sample.SetSampleTime(f as i64 * 166_666);
+                    let _ = sample.SetSampleDuration(166_666);
+                    let _ = sample.AddBuffer(&buf);
+                    wr.sink_writer.WriteSample(wr.video_stream_index, &sample).expect("WriteSample");
+                }
+                wr.sink_writer.Finalize().expect("Finalize");
+                let path = wr.disk_path.take().unwrap();
+                drop(wr);
+                let sz = fs::metadata(&path).unwrap().len();
+                segs36.push(ReplaySegment {
+                    seq_id: i,
+                    ram_data: None,
+                    disk_file: Some(DiskTempFile::new(path)),
+                    size_bytes: sz,
+                    duration_seconds: 5.0,
+                });
+            }
+            let merged = tmp.join("merged_36.mp4");
+            let ok = merge_segments_pure_native(&segs36, &merged, 60);
+            let msz = fs::metadata(&merged).map(|m| m.len()).unwrap_or(0);
+            assert!(ok && msz > 10_000, "36-segment merge failed (ok={ok}, size={msz})");
+        }
+        drop(segs36);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
