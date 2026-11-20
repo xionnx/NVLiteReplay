@@ -1,0 +1,13 @@
+# User config & runtime artifacts
+NVLiteReplayRust.ini
+*.ini
+*.voice
+*.log
+target/
+Cargo.lock
+*.mp4
+*.pdb
+
+# Release binaries & archives (upload to GitHub Releases instead)
+*.exe
+*.zip
