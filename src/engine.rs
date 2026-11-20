@@ -73,7 +73,10 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, PostMessageW};
 
-use crate::audio::{enumerate_audio_input_devices, AudioInputDevice, WasapiStream};
+use crate::audio::{
+    default_audio_endpoint_id, enumerate_audio_input_devices, AudioEndpointMonitor,
+    AudioInputDevice, WasapiStream,
+};
 use crate::config::{BufferStorageMode, ReplayConfig, VideoCodecType};
 use crate::voice::VoiceRecognizer;
 
@@ -449,16 +452,60 @@ impl ReplayEngine {
         }
     }
 
-    fn raise_status(&self, msg: String) {
-        if let Ok(mut guard) = self.status_message.lock() {
-            *guard = msg;
-        }
+    fn notify_ui_status(&self) {
         let raw_hwnd = self.ui_hwnd.lock().map(|g| *g).unwrap_or(0);
         if raw_hwnd != 0 {
             unsafe {
                 let _ = PostMessageW(HWND(raw_hwnd as *mut _), WM_APP_STATUS, WPARAM(0), LPARAM(0));
             }
         }
+    }
+
+    fn sync_active_mic_name(&self, mic_audio: &WasapiStream) {
+        if let Ok(mut g) = self.active_mic_name.lock() {
+            if mic_audio.is_available() {
+                *g = mic_audio.active_device_name().to_string();
+            } else {
+                g.clear();
+            }
+        }
+    }
+
+    fn sync_audio_endpoint(
+        stream: &mut WasapiStream,
+        is_loopback: bool,
+        pinned_device_id: Option<&str>,
+        dirty: bool,
+        retry_interval: Duration,
+        last_retry: &mut Instant,
+    ) -> bool {
+        let invalidated = stream.take_invalidated();
+        let retry_due = !stream.is_available() && last_retry.elapsed() >= retry_interval;
+        if !(dirty || invalidated || retry_due) {
+            return false;
+        }
+
+        let need_reinit = if !stream.is_available() || invalidated {
+            true
+        } else if pinned_device_id.is_none() {
+            default_audio_endpoint_id(is_loopback).as_deref() != Some(stream.active_device_id())
+        } else {
+            false
+        };
+        if !need_reinit {
+            return false;
+        }
+
+        *last_retry = Instant::now();
+        stream.initialize_with_device(is_loopback, pinned_device_id);
+        true
+    }
+
+    fn raise_status(&self, msg: String) {
+        if let Ok(mut guard) = self.status_message.lock() {
+            *guard = msg;
+        }
+        self.notify_ui_status();
     }
 
     fn notify_saved(&self, path: String) {
@@ -990,28 +1037,24 @@ impl ReplayEngine {
 
             let want_audio = cfg_init.record_desktop_audio || cfg_init.record_microphone;
             let cfg_mic_id = cfg_init.effective_mic_device_id().map(str::to_string);
+            let audio_monitor = AudioEndpointMonitor::new();
             let mut desktop_audio = WasapiStream::new();
             let mut mic_audio = WasapiStream::new();
             if cfg_init.record_desktop_audio {
-                desktop_audio.initialize(true);
+                desktop_audio.initialize_with_device(true, None);
             }
             if cfg_init.record_microphone || cfg_init.voice_trigger_enabled {
-                if mic_audio.initialize_with_device(false, cfg_mic_id.as_deref()) {
-                    if let Ok(mut g) = engine.active_mic_name.lock() {
-                        *g = mic_audio.active_device_name().to_string();
-                    }
-                } else if let Ok(mut g) = engine.active_mic_name.lock() {
-                    g.clear();
-                }
+                mic_audio.initialize_with_device(false, cfg_mic_id.as_deref());
+                engine.sync_active_mic_name(&mic_audio);
                 if cfg_init.voice_trigger_enabled && mic_audio.is_available() {
                     mic_audio.set_voice_tap_enabled(true);
                 }
             } else if let Ok(mut g) = engine.active_mic_name.lock() {
                 g.clear();
             }
-            let audio_active = want_audio
-                && ((cfg_init.record_desktop_audio && desktop_audio.is_available())
-                    || (cfg_init.record_microphone && mic_audio.is_available()));
+            // Keep audio track active when user enabled audio recording so plugging in or switching
+            // speakers/headphones mid-session resumes sound seamlessly on the same AAC track.
+            let audio_active = want_audio;
 
             // Try ultra-low-VRAM GPU NV12 pipeline first (1 BGRA comp canvas + 4 compact NV12 targets + D3D11 VideoProcessor).
             const RING_SLOTS: usize = 4;
@@ -1225,6 +1268,7 @@ impl ReplayEngine {
             let mut mixed_floats = vec![0.0f32; AUDIO_CHUNK_FLOATS];
             let mut mixed_bytes = vec![0u8; AUDIO_CHUNK_FLOATS * 2];
             let mut voice_mono_buf: Vec<f32> = Vec::with_capacity(2048);
+            let mut last_desk_retry = Instant::now() - Duration::from_secs(10);
             let mut last_mic_retry = Instant::now() - Duration::from_secs(10);
 
             while engine.is_running.load(Ordering::Acquire) {
@@ -1522,7 +1566,7 @@ impl ReplayEngine {
                         .WriteSample(aw.video_stream_index, &sample);
                 }
 
-                // 3. Drain & Write Audio Chunks + Voice Recognition Tap
+                // 3. Drain & Write Audio Chunks + Voice Recognition Tap (with zero-poll endpoint hot-swap)
                 let (live_voice_enabled, live_voice_sens, live_voice_cd) = {
                     let live_cfg = engine.config.lock().unwrap();
                     (
@@ -1533,16 +1577,36 @@ impl ReplayEngine {
                 };
                 let voice_enrolling = engine.voice.is_enrolling();
                 let voice_want_mic = live_voice_enabled || voice_enrolling;
-                if voice_want_mic
-                    && !mic_audio.is_available()
-                    && last_mic_retry.elapsed() >= Duration::from_secs(3)
-                {
-                    if mic_audio.initialize_with_device(false, cfg_mic_id.as_deref()) {
-                        if let Ok(mut g) = engine.active_mic_name.lock() {
-                            *g = mic_audio.active_device_name().to_string();
-                        }
+
+                let render_dirty = audio_monitor.take_render_dirty();
+                if cfg_init.record_desktop_audio {
+                    Self::sync_audio_endpoint(
+                        &mut desktop_audio,
+                        true,
+                        None,
+                        render_dirty,
+                        Duration::from_millis(400),
+                        &mut last_desk_retry,
+                    );
+                }
+
+                let cap_dirty = audio_monitor.take_capture_dirty();
+                if cap_dirty {
+                    engine.refresh_audio_inputs();
+                    engine.notify_ui_status();
+                }
+                if cfg_init.record_microphone || voice_want_mic {
+                    if Self::sync_audio_endpoint(
+                        &mut mic_audio,
+                        false,
+                        cfg_mic_id.as_deref(),
+                        cap_dirty,
+                        Duration::from_secs(1),
+                        &mut last_mic_retry,
+                    ) {
+                        engine.sync_active_mic_name(&mic_audio);
+                        engine.notify_ui_status();
                     }
-                    last_mic_retry = Instant::now();
                 }
                 mic_audio.set_voice_tap_enabled(voice_want_mic && mic_audio.is_available());
 

@@ -1,15 +1,22 @@
+use std::ffi::c_void;
 use std::ptr::null_mut;
-use windows::core::{GUID, PCWSTR, PWSTR};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{E_NOINTERFACE, S_OK};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    eCapture, eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioCaptureClient, IAudioClient,
+    IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
@@ -97,6 +104,209 @@ pub fn enumerate_audio_input_devices() -> Vec<AudioInputDevice> {
     devices
 }
 
+/// Queries the current Windows default endpoint ID for render (`is_loopback == true`) or capture.
+pub fn default_audio_endpoint_id(is_loopback: bool) -> Option<String> {
+    unsafe {
+        let need_uninit = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let res = (|| -> Option<String> {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let flow = if is_loopback { eRender } else { eCapture };
+            let dev = enumerator.GetDefaultAudioEndpoint(flow, eConsole).ok()?;
+            let raw_id = dev.GetId().ok()?;
+            let id = pwstr_to_string_and_free(raw_id);
+            if id.is_empty() {
+                None
+            } else {
+                Some(id)
+            }
+        })();
+        if need_uninit {
+            CoUninitialize();
+        }
+        res
+    }
+}
+
+const IID_IAGILE_OBJECT: GUID = GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
+
+#[repr(C)]
+struct ComAudioNotifier {
+    vtable: *const IMMNotificationClient_Vtbl,
+    ref_count: AtomicU32,
+    render_dirty: Arc<AtomicBool>,
+    capture_dirty: Arc<AtomicBool>,
+}
+
+static AUDIO_NOTIFIER_VTABLE: IMMNotificationClient_Vtbl = IMMNotificationClient_Vtbl {
+    base__: windows::core::IUnknown_Vtbl {
+        QueryInterface: notifier_query_interface,
+        AddRef: notifier_add_ref,
+        Release: notifier_release,
+    },
+    OnDeviceStateChanged: notifier_on_state_changed,
+    OnDeviceAdded: notifier_on_device_added,
+    OnDeviceRemoved: notifier_on_device_removed,
+    OnDefaultDeviceChanged: notifier_on_default_changed,
+    OnPropertyValueChanged: notifier_on_prop_changed,
+};
+
+unsafe extern "system" fn notifier_query_interface(
+    this: *mut c_void,
+    iid: *const GUID,
+    interface: *mut *mut c_void,
+) -> HRESULT {
+    if interface.is_null() || iid.is_null() {
+        return E_NOINTERFACE;
+    }
+    let id = *iid;
+    if id == windows::core::IUnknown::IID
+        || id == IMMNotificationClient::IID
+        || id == IID_IAGILE_OBJECT
+    {
+        *interface = this;
+        notifier_add_ref(this);
+        return S_OK;
+    }
+    *interface = null_mut();
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn notifier_add_ref(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const ComAudioNotifier);
+    obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn notifier_release(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const ComAudioNotifier);
+    let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this as *mut ComAudioNotifier));
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn notifier_on_state_changed(
+    this: *mut c_void,
+    _device_id: PCWSTR,
+    _new_state: DEVICE_STATE,
+) -> HRESULT {
+    let obj = &*(this as *const ComAudioNotifier);
+    obj.render_dirty.store(true, Ordering::Release);
+    obj.capture_dirty.store(true, Ordering::Release);
+    S_OK
+}
+
+unsafe extern "system" fn notifier_on_device_added(
+    _this: *mut c_void,
+    _device_id: PCWSTR,
+) -> HRESULT {
+    S_OK
+}
+
+unsafe extern "system" fn notifier_on_device_removed(
+    this: *mut c_void,
+    _device_id: PCWSTR,
+) -> HRESULT {
+    let obj = &*(this as *const ComAudioNotifier);
+    obj.render_dirty.store(true, Ordering::Release);
+    obj.capture_dirty.store(true, Ordering::Release);
+    S_OK
+}
+
+unsafe extern "system" fn notifier_on_default_changed(
+    this: *mut c_void,
+    flow: EDataFlow,
+    role: ERole,
+    _default_device_id: PCWSTR,
+) -> HRESULT {
+    if role == eConsole || role == eMultimedia {
+        let obj = &*(this as *const ComAudioNotifier);
+        if flow == eRender {
+            obj.render_dirty.store(true, Ordering::Release);
+        } else if flow == eCapture {
+            obj.capture_dirty.store(true, Ordering::Release);
+        }
+    }
+    S_OK
+}
+
+unsafe extern "system" fn notifier_on_prop_changed(
+    _this: *mut c_void,
+    _device_id: PCWSTR,
+    _key: PROPERTYKEY,
+) -> HRESULT {
+    S_OK
+}
+
+/// Zero-polling COM notification watcher for Windows default audio output/input switches.
+pub struct AudioEndpointMonitor {
+    enumerator: Option<IMMDeviceEnumerator>,
+    client: Option<IMMNotificationClient>,
+    render_dirty: Arc<AtomicBool>,
+    capture_dirty: Arc<AtomicBool>,
+}
+
+impl AudioEndpointMonitor {
+    pub fn new() -> Self {
+        let render_dirty = Arc::new(AtomicBool::new(false));
+        let capture_dirty = Arc::new(AtomicBool::new(false));
+        let mut enumerator_opt = None;
+        let mut client_opt = None;
+
+        unsafe {
+            if let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(
+                &MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            ) {
+                let raw = Box::into_raw(Box::new(ComAudioNotifier {
+                    vtable: &AUDIO_NOTIFIER_VTABLE,
+                    ref_count: AtomicU32::new(1),
+                    render_dirty: Arc::clone(&render_dirty),
+                    capture_dirty: Arc::clone(&capture_dirty),
+                }));
+                let client = IMMNotificationClient::from_raw(raw as *mut c_void);
+                if enumerator
+                    .RegisterEndpointNotificationCallback(&client)
+                    .is_ok()
+                {
+                    enumerator_opt = Some(enumerator);
+                    client_opt = Some(client);
+                }
+            }
+        }
+
+        Self {
+            enumerator: enumerator_opt,
+            client: client_opt,
+            render_dirty,
+            capture_dirty,
+        }
+    }
+
+    pub fn take_render_dirty(&self) -> bool {
+        self.render_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_capture_dirty(&self) -> bool {
+        self.capture_dirty.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for AudioEndpointMonitor {
+    fn drop(&mut self) {
+        if let (Some(ref enumerator), Some(ref client)) = (&self.enumerator, &self.client) {
+            unsafe {
+                let _ = enumerator.UnregisterEndpointNotificationCallback(client);
+            }
+        }
+        self.client = None;
+        self.enumerator = None;
+    }
+}
+
 pub struct WasapiStream {
     audio_client: Option<IAudioClient>,
     silence_client: Option<IAudioClient>,
@@ -124,6 +334,8 @@ pub struct WasapiStream {
     last_left: f32,
     last_right: f32,
     initialized: bool,
+    device_invalidated: bool,
+    active_device_id: String,
     active_device_name: String,
 }
 
@@ -153,6 +365,8 @@ impl WasapiStream {
             last_left: 0.0,
             last_right: 0.0,
             initialized: false,
+            device_invalidated: false,
+            active_device_id: String::new(),
             active_device_name: String::new(),
         }
     }
@@ -177,9 +391,36 @@ impl WasapiStream {
         self.initialized
     }
 
+    pub fn active_device_id(&self) -> &str {
+        &self.active_device_id
+    }
+
+    pub fn take_invalidated(&mut self) -> bool {
+        let was = self.device_invalidated;
+        self.device_invalidated = false;
+        was
+    }
+
     #[allow(dead_code)]
     pub fn active_device_name(&self) -> &str {
         &self.active_device_name
+    }
+
+    unsafe fn release_clients(&mut self) {
+        self.initialized = false;
+        if let Some(ref c) = self.audio_client {
+            let _ = c.Stop();
+        }
+        if let Some(ref s) = self.silence_client {
+            let _ = s.Stop();
+        }
+        self.capture_client = None;
+        self.silence_client = None;
+        self.audio_client = None;
+        if !self.mix_format_ptr.is_null() {
+            CoTaskMemFree(Some(self.mix_format_ptr as *const _));
+            self.mix_format_ptr = null_mut();
+        }
     }
 
     #[allow(dead_code)]
@@ -188,22 +429,26 @@ impl WasapiStream {
     }
 
     pub fn initialize_with_device(&mut self, is_loopback: bool, device_id: Option<&str>) -> bool {
-        self.initialized = false;
-        self.capture_client = None;
-        self.silence_client = None;
-        self.audio_client = None;
+        let had_fifo = self.fifo_count > 0;
+        self.device_invalidated = false;
+        self.active_device_id.clear();
         self.active_device_name.clear();
-        self.fifo_read = 0;
-        self.fifo_write = 0;
-        self.fifo_count = 0;
         self.resample_phase = 0.0;
         self.last_left = 0.0;
         self.last_right = 0.0;
-        unsafe {
-            if !self.mix_format_ptr.is_null() {
-                CoTaskMemFree(Some(self.mix_format_ptr as *const _));
-                self.mix_format_ptr = null_mut();
+
+        // Trim any stale excess FIFO on hot-swap while keeping up to ~25ms for clickless transition.
+        if self.fifo_count > 1200 * 2 {
+            let mut drop_count = self.fifo_count - (1200 * 2);
+            if drop_count % 2 != 0 {
+                drop_count -= 1;
             }
+            self.fifo_read = (self.fifo_read + drop_count) % FIFO_CAPACITY;
+            self.fifo_count -= drop_count;
+        }
+
+        unsafe {
+            self.release_clients();
 
             let Ok(enumerator): windows::core::Result<IMMDeviceEnumerator> =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -239,6 +484,11 @@ impl WasapiStream {
                 def
             };
 
+            let resolved_id = device
+                .GetId()
+                .ok()
+                .map(|p| pwstr_to_string_and_free(p))
+                .unwrap_or_default();
             let resolved_name = device_friendly_name(&device);
 
             let Ok(audio_client): windows::core::Result<IAudioClient> =
@@ -281,12 +531,14 @@ impl WasapiStream {
                 .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, mix_fmt, None)
                 .is_err()
             {
+                self.release_clients();
                 return false;
             }
 
             let Ok(capture_client): windows::core::Result<IAudioCaptureClient> =
                 audio_client.GetService()
             else {
+                self.release_clients();
                 return false;
             };
 
@@ -303,14 +555,20 @@ impl WasapiStream {
             }
 
             if audio_client.Start().is_err() {
+                self.release_clients();
                 return false;
             }
 
-            // Initial 35ms (1680 stereo frames) anti-jitter cushion
-            self.push_stereo_sample(0.0, 0.0, 1680);
+            // Push initial 35ms anti-jitter cushion on fresh start (or small 15ms cushion on hot-swap).
+            if !had_fifo {
+                self.push_stereo_sample(0.0, 0.0, 1680);
+            } else if self.fifo_count < 720 * 2 {
+                self.push_stereo_sample(0.0, 0.0, 720);
+            }
 
             self.audio_client = Some(audio_client);
             self.capture_client = Some(capture_client);
+            self.active_device_id = resolved_id;
             self.active_device_name = resolved_name;
             self.initialized = true;
             true
@@ -415,8 +673,14 @@ impl WasapiStream {
 
         unsafe {
             loop {
-                let Ok(packet_len) = capture.GetNextPacketSize() else {
-                    break;
+                let packet_len = match capture.GetNextPacketSize() {
+                    Ok(len) => len,
+                    Err(_) => {
+                        drop(capture);
+                        self.release_clients();
+                        self.device_invalidated = true;
+                        return;
+                    }
                 };
                 if packet_len == 0 {
                     break;
@@ -429,7 +693,10 @@ impl WasapiStream {
                     .GetBuffer(&mut data_ptr, &mut num_frames, &mut flags, None, None)
                     .is_err()
                 {
-                    break;
+                    drop(capture);
+                    self.release_clients();
+                    self.device_invalidated = true;
+                    return;
                 }
 
                 if num_frames > 0 && self.fifo_count == 0 {
@@ -538,21 +805,40 @@ impl WasapiStream {
 
 impl Drop for WasapiStream {
     fn drop(&mut self) {
-        self.initialized = false;
         unsafe {
-            if let Some(ref c) = self.audio_client {
-                let _ = c.Stop();
+            self.release_clients();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_endpoint_monitor_and_hotswap_safe() {
+        unsafe {
+            let need_uninit = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            {
+                let mon = AudioEndpointMonitor::new();
+                assert!(!mon.take_render_dirty());
+                assert!(!mon.take_capture_dirty());
             }
-            if let Some(ref s) = self.silence_client {
-                let _ = s.Stop();
+
+            let mut loop_stream = WasapiStream::new();
+            if let Some(def_out) = default_audio_endpoint_id(true) {
+                assert!(loop_stream.initialize_with_device(true, None));
+                assert_eq!(loop_stream.active_device_id(), def_out);
+                loop_stream.drain_packets();
+                // Hot-swap re-initialization must stop old clients cleanly & preserve availability.
+                assert!(loop_stream.initialize_with_device(true, None));
+                assert!(loop_stream.is_available());
             }
-            if !self.mix_format_ptr.is_null() {
-                CoTaskMemFree(Some(self.mix_format_ptr as *const _));
-                self.mix_format_ptr = null_mut();
+            drop(loop_stream);
+
+            if need_uninit {
+                CoUninitialize();
             }
         }
-        self.capture_client = None;
-        self.silence_client = None;
-        self.audio_client = None;
     }
 }
