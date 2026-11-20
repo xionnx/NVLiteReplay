@@ -11,7 +11,19 @@
 
 Aplikasi Instant Replay ultra-ringan dalam satu file portable tanpa service background, tanpa telemetry, dan tanpa install driver tambahan. Mendukung **NVIDIA NVENC**, **AMD AMF**, maupun **Intel QSV**.
 
+<br>
+
+<img src="assets/ui-video.png" alt="NVLiteReplay Minimalist Dark UI" width="520">
+
 </div>
+
+---
+
+## Tampilan Antarmuka
+
+| Audio & Input Mic | Sistem & Hotkey | Voice Clip Trigger |
+| :---: | :---: | :---: |
+| <img src="assets/ui-audio.png" alt="Tab Audio" width="270"> | <img src="assets/ui-system.png" alt="Tab Sistem" width="270"> | <img src="assets/ui-voice.png" alt="Tab Voice Clip" width="270"> |
 
 ---
 
