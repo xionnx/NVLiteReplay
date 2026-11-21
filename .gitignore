@@ -11,3 +11,9 @@ Cargo.lock
 # Release binaries & archives (upload to GitHub Releases instead)
 *.exe
 *.zip
+
+# E2E reports
+test-results/
+
+# Office lock files
+~$*

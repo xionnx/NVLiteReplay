@@ -171,16 +171,18 @@ impl ReplaySegment {
 
 struct ComMfGuard {
     with_timer: bool,
+    com_owned: bool,
 }
 
 impl ComMfGuard {
     unsafe fn new(with_timer: bool) -> Self {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // RPC_E_CHANGED_MODE on an STA thread (UI) must not be paired with CoUninitialize.
+        let com_owned = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
         if with_timer {
             timeBeginPeriod(1);
         }
         let _ = MFStartup(MF_VERSION, 0);
-        Self { with_timer }
+        Self { with_timer, com_owned }
     }
 }
 
@@ -191,7 +193,9 @@ impl Drop for ComMfGuard {
             if self.with_timer {
                 timeEndPeriod(1);
             }
-            CoUninitialize();
+            if self.com_owned {
+                CoUninitialize();
+            }
         }
     }
 }
@@ -403,6 +407,12 @@ impl GdiFallbackState {
             self.dib = bmp;
             self.dib_bits = bits;
             self.old_bmp = SelectObject(self.mem_dc, HGDIOBJ(self.dib.0));
+        } else {
+            // Release now, otherwise every frame re-acquires DCs until the GDI quota is gone.
+            let _ = DeleteDC(self.mem_dc);
+            ReleaseDC(GetDesktopWindow(), self.screen_dc);
+            self.mem_dc = Default::default();
+            self.screen_dc = Default::default();
         }
     }
 }
@@ -709,6 +719,12 @@ impl ReplayEngine {
             }
         }
 
+        // Quit calls stop() and then exits the process; let an in-flight merge finish first.
+        // ponytail: 30s cap so quit can't hang forever on a stuck merge
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.is_saving.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
         self.clear_buffer();
         if let Ok(mut s) = self.capture_mode_status.lock() {
             *s = "Standby".to_string();
@@ -849,6 +865,7 @@ impl ReplayEngine {
                 }
             }
 
+            let _ = fs::remove_file(&output_path);
             engine.raise_status("Gagal menggabungkan segmen replay.".to_string());
             engine.is_saving.store(false, Ordering::Release);
         });

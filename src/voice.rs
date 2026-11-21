@@ -410,7 +410,8 @@ impl VoiceRecognizer {
     ) {
         {
             let mut g = self.inner.lock().unwrap();
-            if g.is_enrolling {
+            let still_active = g.enroll_deadline.is_some_and(|d| Instant::now() < d);
+            if g.is_enrolling && still_active {
                 return;
             }
             g.phrase_label = phrase.to_string();
@@ -443,6 +444,8 @@ impl VoiceRecognizer {
                     let mut g = rec_clone.inner.lock().unwrap();
                     g.is_enrolling = false;
                     g.last_status = "Gagal mengakses mikrofon Windows (cek izin Mic).".to_string();
+                    drop(g);
+                    drop(mic);
                     unsafe { windows::Win32::System::Com::CoUninitialize(); }
                     return;
                 }
@@ -478,6 +481,7 @@ impl VoiceRecognizer {
                         g.mic_level = 0.0;
                     }
                 }
+                drop(mic);
                 unsafe { windows::Win32::System::Com::CoUninitialize(); }
             });
         }
@@ -706,7 +710,7 @@ fn load_voice_file() -> Option<(String, Vec<VoiceTemplate>)> {
             let mut parts = rest.split_whitespace();
             let dur: f32 = parts.next()?.parse().ok()?;
             let nframes: usize = parts.next()?.parse().ok()?;
-            let mut frames = Vec::with_capacity(nframes);
+            let mut frames = Vec::with_capacity(nframes.min(4096));
             for _ in 0..nframes {
                 let row = lines.next()?;
                 let mut arr = [0.0f32; FEAT_DIM];
