@@ -36,7 +36,7 @@ Test case acuan: `docs/TEST_CASES.md`.
 
 | Lapis | Perintah | Butuh | Cakupan |
 |---|---|---|---|
-| 1. Unit | `cargo test` | Toolchain saja (beberapa test memakai GPU) | Parser hotkey/INI, Annex-B converter, DSP voice, repro stop DiskTemp+HEVC |
+| 1. Unit | `cargo test -- --test-threads=1` | Toolchain saja (beberapa test memakai GPU) | Parser hotkey/INI, Annex-B converter, DSP voice, repro stop DiskTemp+HEVC |
 | 2. Self-test | `NVLiteReplayRustVoiceRecog.exe --verify-self-test` | GPU + monitor | Voice DSP, DXGI capture, NVENC/HEVC, async stop DiskTemp. Output ke folder temp, membaca INI di folder exe |
 | 3. E2E black-box | Harness PowerShell (bagian 4) | GPU + monitor, tidak ada instance lain | Alur user: nyala → simpan → matikan → tutup, validasi MP4 |
 | 4. Manual | `docs/TEST_CASES.md` | Tester | UI visual, voice, game fullscreen, Alt+Tab, UAC, ganti perangkat audio |
@@ -69,7 +69,8 @@ Build: `.\build.ps1` → `NVLiteReplayRustVoiceRecog.exe` di root repo (di-ignor
 - Test ada di modul `#[cfg(test)]` masing-masing file (`engine.rs`, `config.rs`, `voice.rs`, ...).
 - Logic murni (parser INI/hotkey, konversi hvcC/avcC → Annex-B, MFCC/DTW, urutan segmen) **wajib** punya unit test saat diubah. Satu test kecil yang gagal bila logic rusak; tidak perlu framework tambahan.
 - Test yang menyentuh GPU (mis. `repro_disk_hevc_stop`) memakai folder temp sendiri dan memastikan tidak ada `seg_<pid>_*.mp4` tersisa. Pola ini dipakai untuk test baru yang menulis file.
-- Saat ini 8 test. Jumlah berubah → perbarui `TC-UNIT-01` di `docs/TEST_CASES.md`.
+- Saat ini 12 test. Jumlah berubah → perbarui `TC-UNIT-01` di `docs/TEST_CASES.md` dan Excel.
+- **Jalankan serial: `cargo test -- --test-threads=1`.** Mode paralel default sering crash `STATUS_ACCESS_VIOLATION` (0xc0000005) atau gagal acak karena beberapa test GPU/Media Foundation berjalan bersamaan (terjadi juga di `main`).
 
 ---
 
@@ -191,7 +192,7 @@ Script hanya menulis kolom N-R (Actual, Status, Tester, Tanggal, Catatan); formu
 
 | ID | Level | Cara |
 |---|---|---|
-| TC-UNIT-01 | Otomatis | `cargo test` |
+| TC-UNIT-01 | Otomatis | `cargo test -- --test-threads=1` |
 | TC-STR-04 | Otomatis | `--verify-self-test`, exit code 0 |
 | TC-STR-01 | Otomatis | Sandbox tanpa INI → proses hidup ≥ 3 dtk, jendela `NVLiteReplayRustVoiceRecogMainWnd` ada |
 | TC-STR-02 | Otomatis | Jalankan exe kedua → keluar sendiri, proses pertama tetap hidup |

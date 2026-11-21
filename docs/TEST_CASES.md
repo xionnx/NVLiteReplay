@@ -125,7 +125,7 @@
 
 | ID | Judul | Prio | Langkah | Hasil yang Diharapkan | Status |
 | :--- | :--- | :---: | :--- | :--- | :---: |
-| TC-UNIT-01 | Unit test Rust | P1 | `cargo test` | `8 passed; 0 failed` | |
+| TC-UNIT-01 | Unit test Rust | P1 | `cargo test -- --test-threads=1` | `12 passed; 0 failed` | |
 
 ---
 
