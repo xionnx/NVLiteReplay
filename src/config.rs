@@ -36,6 +36,23 @@ impl VideoCodecType {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub enum DesktopAudioMode {
+    AllDesktop = 0,
+    ActiveGameOnly = 1,
+}
+
+impl DesktopAudioMode {
+    pub fn from_i32(v: i32) -> Self {
+        if v == 1 {
+            DesktopAudioMode::ActiveGameOnly
+        } else {
+            DesktopAudioMode::AllDesktop
+        }
+    }
+}
+
 pub const HK_MOD_ALT: u32 = 0x0001;
 pub const HK_MOD_CONTROL: u32 = 0x0002;
 pub const HK_MOD_SHIFT: u32 = 0x0004;
@@ -284,6 +301,7 @@ pub struct ReplayConfig {
     pub hotkey_mute: HotkeyBinding,
 
     pub record_desktop_audio: bool,
+    pub desktop_audio_mode: DesktopAudioMode,
     pub record_microphone: bool,
     pub desktop_volume_percent: u32,
     pub mic_volume_percent: u32,
@@ -299,6 +317,7 @@ pub struct ReplayConfig {
     pub temp_folder: String,
     pub clip_name_template: String,
     pub game_name_map: String,
+    pub run_on_startup: bool,
     pub minimize_to_tray_on_close: bool,
     pub play_sound_on_save: bool,
     pub suppress_notifications_in_game: bool,
@@ -342,6 +361,7 @@ impl Default for ReplayConfig {
             hotkey_save,
             hotkey_mute,
             record_desktop_audio: true,
+            desktop_audio_mode: DesktopAudioMode::AllDesktop,
             record_microphone: true,
             desktop_volume_percent: 100,
             mic_volume_percent: 100,
@@ -355,6 +375,7 @@ impl Default for ReplayConfig {
             temp_folder,
             clip_name_template: DEFAULT_CLIP_NAME_TEMPLATE.to_string(),
             game_name_map: DEFAULT_GAME_NAME_MAP.to_string(),
+            run_on_startup: false,
             minimize_to_tray_on_close: true,
             play_sound_on_save: true,
             suppress_notifications_in_game: true,
@@ -426,6 +447,7 @@ impl ReplayConfig {
         if let Ok(content) = fs::read_to_string(path) {
             cfg.apply_ini_str(&content);
         }
+        cfg.run_on_startup = is_run_on_startup_enabled();
         cfg
     }
 
@@ -527,6 +549,11 @@ impl ReplayConfig {
                         self.record_desktop_audio = b;
                     }
                 }
+                "DesktopAudioMode" => {
+                    if let Ok(n) = val.parse::<i32>() {
+                        self.desktop_audio_mode = DesktopAudioMode::from_i32(n);
+                    }
+                }
                 "RecordMicrophone" => {
                     if let Ok(b) = parse_bool(val) {
                         self.record_microphone = b;
@@ -600,6 +627,11 @@ impl ReplayConfig {
                         self.game_name_map = val.to_string();
                     }
                 }
+                "RunOnStartup" => {
+                    if let Ok(b) = parse_bool(val) {
+                        self.run_on_startup = b;
+                    }
+                }
                 "MinimizeToTrayOnClose" => {
                     if let Ok(b) = parse_bool(val) {
                         self.minimize_to_tray_on_close = b;
@@ -652,6 +684,7 @@ impl ReplayConfig {
              HotkeySave={}\n\
              HotkeyMute={}\n\
              RecordDesktopAudio={}\n\
+             DesktopAudioMode={}\n\
              RecordMicrophone={}\n\
              DesktopVolumePercent={}\n\
              MicVolumePercent={}\n\
@@ -665,6 +698,7 @@ impl ReplayConfig {
              TempFolder={}\n\
              ClipNameTemplate={}\n\
              GameNameMap={}\n\
+             RunOnStartup={}\n\
              MinimizeToTrayOnClose={}\n\
              PlaySoundOnSave={}\n\
              SuppressNotificationsInGame={}\n\
@@ -683,6 +717,7 @@ impl ReplayConfig {
             self.hotkey_save.display(),
             self.hotkey_mute.display(),
             self.record_desktop_audio,
+            self.desktop_audio_mode as i32,
             self.record_microphone,
             self.desktop_volume_percent,
             self.mic_volume_percent,
@@ -696,6 +731,7 @@ impl ReplayConfig {
             self.temp_folder,
             self.clip_name_template,
             self.game_name_map,
+            self.run_on_startup,
             self.minimize_to_tray_on_close,
             self.play_sound_on_save,
             self.suppress_notifications_in_game,
@@ -939,6 +975,174 @@ pub fn format_clip_relative_path(
     rel
 }
 
+const HKEY_CURRENT_USER: isize = -2147483647i32 as isize;
+const KEY_READ: u32 = 0x20019;
+const KEY_SET_VALUE: u32 = 0x0002;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const ERROR_SUCCESS: i32 = 0;
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const STARTUP_RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const STARTUP_VALUE_NAME: &str = "NVLiteReplay";
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(
+        hkey: isize,
+        lpsubkey: *const u16,
+        uloptions: u32,
+        samdesired: u32,
+        phkresult: *mut isize,
+    ) -> i32;
+    fn RegCreateKeyExW(
+        hkey: isize,
+        lpsubkey: *const u16,
+        reserved: u32,
+        lpclass: *const u16,
+        dwoptions: u32,
+        samdesired: u32,
+        lpsecurityattributes: *const std::ffi::c_void,
+        phkresult: *mut isize,
+        lpdwdisposition: *mut u32,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hkey: isize,
+        lpvaluename: *const u16,
+        lpreserved: *const u32,
+        lptype: *mut u32,
+        lpdata: *mut u8,
+        lpcbdata: *mut u32,
+    ) -> i32;
+    fn RegSetValueExW(
+        hkey: isize,
+        lpvaluename: *const u16,
+        reserved: u32,
+        dwtype: u32,
+        lpdata: *const u8,
+        cbdata: u32,
+    ) -> i32;
+    fn RegDeleteValueW(hkey: isize, lpvaluename: *const u16) -> i32;
+    fn RegCloseKey(hkey: isize) -> i32;
+}
+
+fn to_wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+pub fn startup_registry_command_for_exe(exe_path: &Path) -> String {
+    format!("\"{}\" --minimized", exe_path.display())
+}
+
+fn query_run_on_startup_value(value_name: &str) -> Option<String> {
+    unsafe {
+        let subkey_w = to_wide_null(STARTUP_RUN_SUBKEY);
+        let name_w = to_wide_null(value_name);
+        let mut hkey: isize = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey_w.as_ptr(), 0, KEY_READ, &mut hkey) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let mut reg_type: u32 = 0;
+        let mut cb_data: u32 = 0;
+        let rc = RegQueryValueExW(
+            hkey,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut reg_type,
+            std::ptr::null_mut(),
+            &mut cb_data,
+        );
+        if rc != ERROR_SUCCESS || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ) || cb_data == 0 {
+            RegCloseKey(hkey);
+            return None;
+        }
+        let mut buf = vec![0u16; ((cb_data as usize) + 1) / 2];
+        let mut read_bytes = (buf.len() * 2) as u32;
+        let rc2 = RegQueryValueExW(
+            hkey,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut reg_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut read_bytes,
+        );
+        RegCloseKey(hkey);
+        if rc2 != ERROR_SUCCESS {
+            return None;
+        }
+        let words = (read_bytes as usize / 2).min(buf.len());
+        let end = buf[..words].iter().position(|&c| c == 0).unwrap_or(words);
+        Some(String::from_utf16_lossy(&buf[..end]))
+    }
+}
+
+fn set_run_on_startup_value(value_name: &str, exe_path: &Path, enabled: bool) -> bool {
+    unsafe {
+        let subkey_w = to_wide_null(STARTUP_RUN_SUBKEY);
+        let name_w = to_wide_null(value_name);
+        if enabled {
+            let mut hkey: isize = 0;
+            let rc = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey_w.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut hkey,
+                std::ptr::null_mut(),
+            );
+            if rc != ERROR_SUCCESS {
+                return false;
+            }
+            let cmd = startup_registry_command_for_exe(exe_path);
+            let cmd_w = to_wide_null(&cmd);
+            let rc2 = RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                REG_SZ,
+                cmd_w.as_ptr() as *const u8,
+                (cmd_w.len() * 2) as u32,
+            );
+            RegCloseKey(hkey);
+            rc2 == ERROR_SUCCESS
+        } else {
+            let mut hkey: isize = 0;
+            let rc = RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                subkey_w.as_ptr(),
+                0,
+                KEY_SET_VALUE,
+                &mut hkey,
+            );
+            if rc == ERROR_FILE_NOT_FOUND {
+                return true;
+            }
+            if rc != ERROR_SUCCESS {
+                return false;
+            }
+            let rc2 = RegDeleteValueW(hkey, name_w.as_ptr());
+            RegCloseKey(hkey);
+            rc2 == ERROR_SUCCESS || rc2 == ERROR_FILE_NOT_FOUND
+        }
+    }
+}
+
+pub fn is_run_on_startup_enabled() -> bool {
+    query_run_on_startup_value(STARTUP_VALUE_NAME)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+pub fn set_run_on_startup(enabled: bool) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    set_run_on_startup_value(STARTUP_VALUE_NAME, &exe, enabled)
+}
+
 fn parse_bool(s: &str) -> Result<bool, ()> {
     if s.eq_ignore_ascii_case("true") || s == "1" {
         Ok(true)
@@ -1161,5 +1365,38 @@ mod tests {
             lookup_custom_game_name(&cfg.game_name_map, "custom.exe"),
             Some("CustomApp".to_string())
         );
+    }
+
+    #[test]
+    fn desktop_audio_mode_and_run_on_startup_ini_roundtrip() {
+        let mut cfg = ReplayConfig::default();
+        assert_eq!(cfg.desktop_audio_mode, DesktopAudioMode::AllDesktop);
+        assert!(!cfg.run_on_startup);
+
+        cfg.apply_ini_str("DesktopAudioMode=1\nRunOnStartup=true\n");
+        assert_eq!(cfg.desktop_audio_mode, DesktopAudioMode::ActiveGameOnly);
+        assert!(cfg.run_on_startup);
+
+        cfg.apply_ini_str("DesktopAudioMode=99\nRunOnStartup=false\n");
+        assert_eq!(cfg.desktop_audio_mode, DesktopAudioMode::AllDesktop);
+        assert!(!cfg.run_on_startup);
+    }
+
+    #[test]
+    fn startup_registry_roundtrip_temp_value() {
+        let test_name = "NVLiteReplay_UnitTest_Startup";
+        let fake_exe = Path::new(r"C:\Program Files\NVLiteReplay\NVLiteReplayRustVoiceRecog.exe");
+
+        assert!(set_run_on_startup_value(test_name, fake_exe, false));
+        assert!(set_run_on_startup_value(test_name, fake_exe, true));
+
+        let stored = query_run_on_startup_value(test_name);
+        assert_eq!(
+            stored,
+            Some(startup_registry_command_for_exe(fake_exe))
+        );
+
+        assert!(set_run_on_startup_value(test_name, fake_exe, false));
+        assert_eq!(query_run_on_startup_value(test_name), None);
     }
 }

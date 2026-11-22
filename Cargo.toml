@@ -1,6 +1,6 @@
 [package]
 name = "nv_lite_replay_rust_voice_recog"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 description = "Universal ultra-low resource Instant Replay in pure Rust with Pure-Rust MFCC+DTW Custom Voice Recognition"
 license = "MIT"

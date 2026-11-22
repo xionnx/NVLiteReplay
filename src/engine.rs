@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR, VARIANT};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, RECT, STILL_ACTIVE, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
@@ -73,9 +75,10 @@ use windows::Win32::System::Diagnostics::Debug::Beep;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW,
-    SetWaitableTimer, WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateWaitableTimerExW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
+    QueryFullProcessImageNameW, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -88,7 +91,7 @@ use crate::audio::{
 };
 use crate::config::{
     clean_exe_stem_name, format_clip_relative_path, lookup_custom_game_name,
-    sanitize_path_component, BufferStorageMode, ReplayConfig, VideoCodecType,
+    sanitize_path_component, BufferStorageMode, DesktopAudioMode, ReplayConfig, VideoCodecType,
 };
 use crate::voice::VoiceRecognizer;
 
@@ -572,6 +575,7 @@ pub struct ReplayEngine {
     pub displays: Mutex<Vec<DisplayTarget>>,
     pub mic_devices: Mutex<Vec<AudioInputDevice>>,
     pub active_mic_name: Mutex<String>,
+    pub active_desktop_audio_label: Mutex<String>,
     pub gpu_name: Mutex<String>,
     pub codec_caps: Mutex<HardwareCodecCaps>,
     pub capture_mode_status: Mutex<String>,
@@ -607,6 +611,7 @@ impl ReplayEngine {
             displays: Mutex::new(Vec::new()),
             mic_devices: Mutex::new(Vec::new()),
             active_mic_name: Mutex::new(String::new()),
+            active_desktop_audio_label: Mutex::new(String::new()),
             gpu_name: Mutex::new("Hardware GPU Encoder".to_string()),
             codec_caps: Mutex::new(caps),
             capture_mode_status: Mutex::new("Standby".to_string()),
@@ -676,6 +681,89 @@ impl ReplayEngine {
             } else {
                 g.clear();
             }
+        }
+    }
+
+    fn set_desktop_audio_label(&self, label: String) {
+        if let Ok(mut g) = self.active_desktop_audio_label.lock() {
+            if *g != label {
+                *g = label;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sync_active_game_audio(
+        &self,
+        desktop_audio: &mut WasapiStream,
+        locked_game: &mut Option<(u32, String)>,
+        fallback_all: &mut bool,
+        game_name_map: &str,
+        render_dirty: bool,
+        last_desk_retry: &mut Instant,
+        invalidated: bool,
+    ) {
+        if *fallback_all {
+            Self::sync_audio_endpoint(
+                desktop_audio,
+                true,
+                None,
+                render_dirty,
+                Duration::from_millis(400),
+                last_desk_retry,
+            );
+            return;
+        }
+
+        if let Some((pid, _)) = locked_game.as_ref() {
+            if !is_process_alive(*pid) {
+                desktop_audio.stop_and_release();
+                *locked_game = None;
+                self.set_desktop_audio_label("Menunggu game aktif...".to_string());
+                self.notify_ui_status();
+            }
+        }
+
+        if let Some((fg_pid, fg_path)) = detect_foreground_process() {
+            if !is_background_utility_exe(&fg_path) {
+                let need_switch = locked_game.as_ref().map(|(p, _)| *p) != Some(fg_pid)
+                    || invalidated
+                    || !desktop_audio.is_available();
+                if need_switch {
+                    let name = resolve_game_name_for_exe_path(&fg_path, game_name_map);
+                    if desktop_audio.initialize_process_loopback(fg_pid, &name) {
+                        *locked_game = Some((fg_pid, name.clone()));
+                        self.set_desktop_audio_label(format!("Game: {}", name));
+                        self.notify_ui_status();
+                    } else if is_process_alive(fg_pid) {
+                        *fallback_all = true;
+                        *locked_game = None;
+                        *last_desk_retry = Instant::now();
+                        desktop_audio.initialize_with_device(true, None);
+                        self.set_desktop_audio_label("Fallback: Semua Desktop".to_string());
+                        self.notify_ui_status();
+                    }
+                }
+                return;
+            }
+        }
+
+        if let Some((pid, name)) = locked_game.clone() {
+            if (invalidated || !desktop_audio.is_available()) && is_process_alive(pid) {
+                if desktop_audio.initialize_process_loopback(pid, &name) {
+                    self.set_desktop_audio_label(format!("Game: {}", name));
+                    self.notify_ui_status();
+                } else {
+                    *fallback_all = true;
+                    *locked_game = None;
+                    *last_desk_retry = Instant::now();
+                    desktop_audio.initialize_with_device(true, None);
+                    self.set_desktop_audio_label("Fallback: Semua Desktop".to_string());
+                    self.notify_ui_status();
+                }
+            }
+        } else {
+            self.set_desktop_audio_label("Menunggu game aktif...".to_string());
         }
     }
 
@@ -889,6 +977,7 @@ impl ReplayEngine {
         if let Ok(mut p) = self.video_pipeline_status.lock() {
             *p = "Standby".to_string();
         }
+        self.set_desktop_audio_label(String::new());
         self.current_fps_x10.store(0, Ordering::Relaxed);
         trim_working_set();
         self.is_stopping.store(false, Ordering::Release);
@@ -1176,6 +1265,7 @@ impl ReplayEngine {
         if let Ok(mut p) = self.video_pipeline_status.lock() {
             *p = "Standby".to_string();
         }
+        self.set_desktop_audio_label(String::new());
     }
 
     fn capture_loop(engine: Arc<Self>) {
@@ -1384,8 +1474,29 @@ impl ReplayEngine {
             let audio_monitor = AudioEndpointMonitor::new();
             let mut desktop_audio = WasapiStream::new();
             let mut mic_audio = WasapiStream::new();
+            let use_active_game_audio = cfg_init.record_desktop_audio
+                && cfg_init.desktop_audio_mode == DesktopAudioMode::ActiveGameOnly;
+            let mut locked_game_audio: Option<(u32, String)> = None;
+            let mut process_loopback_fallback_all = false;
+            let mut last_desk_retry = Instant::now() - Duration::from_secs(10);
+
             if cfg_init.record_desktop_audio {
-                desktop_audio.initialize_with_device(true, None);
+                if use_active_game_audio {
+                    engine.sync_active_game_audio(
+                        &mut desktop_audio,
+                        &mut locked_game_audio,
+                        &mut process_loopback_fallback_all,
+                        &cfg_init.game_name_map,
+                        false,
+                        &mut last_desk_retry,
+                        false,
+                    );
+                } else {
+                    desktop_audio.initialize_with_device(true, None);
+                    engine.set_desktop_audio_label("Semua Audio Desktop".to_string());
+                }
+            } else {
+                engine.set_desktop_audio_label(String::new());
             }
             if cfg_init.record_microphone || cfg_init.voice_trigger_enabled {
                 mic_audio.initialize_with_device(false, cfg_mic_id.as_deref());
@@ -1612,7 +1723,7 @@ impl ReplayEngine {
             let mut mixed_floats = vec![0.0f32; AUDIO_CHUNK_FLOATS];
             let mut mixed_bytes = vec![0u8; AUDIO_CHUNK_FLOATS * 2];
             let mut voice_mono_buf: Vec<f32> = Vec::with_capacity(2048);
-            let mut last_desk_retry = Instant::now() - Duration::from_secs(10);
+            let mut last_game_audio_check = Instant::now();
             let mut last_mic_retry = Instant::now() - Duration::from_secs(10);
 
             while engine.is_running.load(Ordering::Acquire) {
@@ -1958,14 +2069,33 @@ impl ReplayEngine {
 
                 let render_dirty = audio_monitor.take_render_dirty();
                 if cfg_init.record_desktop_audio {
-                    Self::sync_audio_endpoint(
-                        &mut desktop_audio,
-                        true,
-                        None,
-                        render_dirty,
-                        Duration::from_millis(400),
-                        &mut last_desk_retry,
-                    );
+                    if use_active_game_audio && !process_loopback_fallback_all {
+                        let desk_invalidated = desktop_audio.take_invalidated();
+                        if desk_invalidated
+                            || render_dirty
+                            || last_game_audio_check.elapsed() >= Duration::from_secs(1)
+                        {
+                            last_game_audio_check = Instant::now();
+                            engine.sync_active_game_audio(
+                                &mut desktop_audio,
+                                &mut locked_game_audio,
+                                &mut process_loopback_fallback_all,
+                                &cfg_init.game_name_map,
+                                render_dirty,
+                                &mut last_desk_retry,
+                                desk_invalidated,
+                            );
+                        }
+                    } else {
+                        Self::sync_audio_endpoint(
+                            &mut desktop_audio,
+                            true,
+                            None,
+                            render_dirty,
+                            Duration::from_millis(400),
+                            &mut last_desk_retry,
+                        );
+                    }
                 }
 
                 let cap_dirty = audio_monitor.take_capture_dirty();
@@ -3325,10 +3455,10 @@ pub fn resolve_game_name_for_exe_path(exe_path: &Path, custom_map: &str) -> Stri
     clean_exe_stem_name(&path_str)
 }
 
-/// Queries the foreground window's executable path via
+/// Queries the foreground window's `(pid, exe_path)` via
 /// `GetForegroundWindow` -> `GetWindowThreadProcessId` -> `QueryFullProcessImageNameW`.
 /// Returns `None` if the foreground window belongs to the current `NVLiteReplay` process.
-pub fn detect_foreground_exe_path() -> Option<PathBuf> {
+pub fn detect_foreground_process() -> Option<(u32, PathBuf)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -3357,9 +3487,67 @@ pub fn detect_foreground_exe_path() -> Option<PathBuf> {
         if path_str.trim().is_empty() {
             None
         } else {
-            Some(PathBuf::from(path_str))
+            Some((pid, PathBuf::from(path_str)))
         }
     }
+}
+
+pub fn detect_foreground_exe_path() -> Option<PathBuf> {
+    detect_foreground_process().map(|(_, p)| p)
+}
+
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(hproc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(hproc, &mut exit_code).is_ok();
+        let _ = CloseHandle(hproc);
+        ok && exit_code == STILL_ACTIVE.0 as u32
+    }
+}
+
+/// Returns `true` for desktop shells, chat/music apps, and browsers so Alt-Tabbing to
+/// them does not steal the "Active Game Only" audio loopback lock from a running game.
+pub fn is_background_utility_exe(exe_path: &Path) -> bool {
+    let Some(fname) = exe_path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let lower = fname.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "explorer.exe"
+            | "searchhost.exe"
+            | "searchapp.exe"
+            | "startmenuexperiencehost.exe"
+            | "shellexperiencehost.exe"
+            | "taskmgr.exe"
+            | "applicationframehost.exe"
+            | "lockapp.exe"
+            | "dwm.exe"
+            | "consent.exe"
+            | "systemsettings.exe"
+            | "snippingtool.exe"
+            | "screenclippinghost.exe"
+            | "discord.exe"
+            | "discordptb.exe"
+            | "discordcanary.exe"
+            | "spotify.exe"
+            | "teamspeak.exe"
+            | "ts3client_win64.exe"
+            | "obs64.exe"
+            | "obs32.exe"
+            | "msedge.exe"
+            | "chrome.exe"
+            | "firefox.exe"
+            | "brave.exe"
+            | "opera.exe"
+            | "vivaldi.exe"
+    )
 }
 
 pub fn unique_replay_output_path(out_dir: &Path, template: &str, game_name: &str) -> PathBuf {
@@ -4163,5 +4351,35 @@ mod tests {
             "AvSetMmThreadCharacteristicsW(\"Capture\") should succeed on Windows"
         );
         drop(guard);
+    }
+
+    #[test]
+    fn active_game_audio_filter_and_process_liveness() {
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
+
+        for util in [
+            r"C:\Users\User\AppData\Local\Discord\app-1.0.9000\Discord.exe",
+            r"C:\Users\User\AppData\Roaming\Spotify\Spotify.exe",
+            r"C:\Windows\explorer.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ] {
+            assert!(
+                is_background_utility_exe(Path::new(util)),
+                "{} should be treated as background utility so Alt-Tab doesn't steal audio lock",
+                util
+            );
+        }
+
+        for game in [
+            r"D:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",
+            r"C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\cs2.exe",
+        ] {
+            assert!(
+                !is_background_utility_exe(Path::new(game)),
+                "{} should be allowed for Active Game Audio loopback lock",
+                game
+            );
+        }
     }
 }

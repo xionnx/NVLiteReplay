@@ -65,8 +65,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    BufferStorageMode, HotkeyBinding, HotkeyPresetType, VideoCodecType, HK_MOD_ALT, HK_MOD_CONTROL,
-    HK_MOD_SHIFT, HK_MOD_WIN,
+    BufferStorageMode, DesktopAudioMode, HotkeyBinding, HotkeyPresetType, VideoCodecType,
+    HK_MOD_ALT, HK_MOD_CONTROL, HK_MOD_SHIFT, HK_MOD_WIN,
 };
 use crate::engine::{ReplayEngine, WM_APP_SAVED, WM_APP_STATUS, WM_APP_UPDATE, WM_APP_VOICE_TRIGGER};
 use crate::updater::{UpdateState, APP_VERSION};
@@ -281,12 +281,14 @@ const R_CMB_RES: RectF = RectF::new(20.0, 534.0, 314.0, 34.0);
 const R_CMB_BITRATE: RectF = RectF::new(346.0, 534.0, 314.0, 34.0);
 
 // Tab 1 geometry (Audio)
-const R_TOG_DESKTOP: RectF = RectF::new(600.0, 231.0, 42.0, 22.0);
-const R_SLD_DESKTOP: RectF = RectF::new(36.0, 280.0, 540.0, 26.0);
-const R_TOG_MIC: RectF = RectF::new(600.0, 355.0, 42.0, 22.0);
-const R_MUTE_PILL: RectF = RectF::new(510.0, 354.0, 80.0, 24.0);
-const R_SLD_MIC: RectF = RectF::new(36.0, 404.0, 540.0, 26.0);
-const R_CMB_MIC: RectF = RectF::new(36.0, 474.0, 608.0, 34.0);
+const R_TOG_DESKTOP: RectF = RectF::new(600.0, 227.0, 42.0, 22.0);
+const R_SLD_DESKTOP: RectF = RectF::new(36.0, 272.0, 540.0, 26.0);
+const R_DAUDIO_ALL: RectF = RectF::new(206.0, 317.0, 214.0, 28.0);
+const R_DAUDIO_GAME: RectF = RectF::new(428.0, 317.0, 216.0, 28.0);
+const R_TOG_MIC: RectF = RectF::new(600.0, 390.0, 42.0, 22.0);
+const R_MUTE_PILL: RectF = RectF::new(510.0, 389.0, 80.0, 24.0);
+const R_SLD_MIC: RectF = RectF::new(36.0, 438.0, 540.0, 26.0);
+const R_CMB_MIC: RectF = RectF::new(36.0, 506.0, 608.0, 34.0);
 
 // Tab 2 geometry (Sistem & Hotkey)
 fn hk_slot_rect(idx: usize) -> RectF {
@@ -295,27 +297,28 @@ fn hk_slot_rect(idx: usize) -> RectF {
         1 => 237.0,
         _ => 454.0,
     };
-    RectF::new(x, 226.0, 206.0, 52.0)
+    RectF::new(x, 221.0, 206.0, 48.0)
 }
 
 fn hk_clear_rect(idx: usize) -> RectF {
     let r = hk_slot_rect(idx);
-    RectF::new(r.r - 24.0, r.t + 6.0, 18.0, 18.0)
+    RectF::new(r.r - 24.0, r.t + 5.0, 18.0, 18.0)
 }
 
-const R_HK_PRESET_0: RectF = RectF::new(112.0, 285.0, 146.0, 24.0);
-const R_HK_PRESET_1: RectF = RectF::new(264.0, 285.0, 94.0, 24.0);
-const R_HK_PRESET_2: RectF = RectF::new(364.0, 285.0, 112.0, 24.0);
-const R_BTN_BROWSE: RectF = RectF::new(544.0, 344.0, 116.0, 30.0);
-const R_TPL_0: RectF = RectF::new(20.0, 400.0, 210.0, 26.0);
-const R_TPL_1: RectF = RectF::new(236.0, 400.0, 210.0, 26.0);
-const R_TPL_2: RectF = RectF::new(452.0, 400.0, 208.0, 26.0);
-const R_BTN_TEMP_BROWSE: RectF = RectF::new(466.0, 452.0, 116.0, 30.0);
-const R_BTN_TEMP_RESET: RectF = RectF::new(588.0, 452.0, 72.0, 30.0);
-const R_TOG_TRAY: RectF = RectF::new(618.0, 520.0, 42.0, 22.0);
-const R_TOG_BEEP: RectF = RectF::new(618.0, 551.0, 42.0, 22.0);
-const R_TOG_FOCUS: RectF = RectF::new(618.0, 582.0, 42.0, 22.0);
-const R_TOG_AUTO_UPDATE: RectF = RectF::new(618.0, 613.0, 42.0, 22.0);
+const R_HK_PRESET_0: RectF = RectF::new(112.0, 275.0, 146.0, 23.0);
+const R_HK_PRESET_1: RectF = RectF::new(264.0, 275.0, 94.0, 23.0);
+const R_HK_PRESET_2: RectF = RectF::new(364.0, 275.0, 112.0, 23.0);
+const R_BTN_BROWSE: RectF = RectF::new(544.0, 329.0, 116.0, 28.0);
+const R_TPL_0: RectF = RectF::new(20.0, 380.0, 210.0, 24.0);
+const R_TPL_1: RectF = RectF::new(236.0, 380.0, 210.0, 24.0);
+const R_TPL_2: RectF = RectF::new(452.0, 380.0, 208.0, 24.0);
+const R_BTN_TEMP_BROWSE: RectF = RectF::new(466.0, 428.0, 116.0, 28.0);
+const R_BTN_TEMP_RESET: RectF = RectF::new(588.0, 428.0, 72.0, 28.0);
+const R_TOG_STARTUP: RectF = RectF::new(618.0, 489.0, 42.0, 22.0);
+const R_TOG_TRAY: RectF = RectF::new(618.0, 519.0, 42.0, 22.0);
+const R_TOG_BEEP: RectF = RectF::new(618.0, 549.0, 42.0, 22.0);
+const R_TOG_FOCUS: RectF = RectF::new(618.0, 579.0, 42.0, 22.0);
+const R_TOG_AUTO_UPDATE: RectF = RectF::new(618.0, 609.0, 42.0, 22.0);
 
 fn clip_tpl_rect(idx: usize) -> RectF {
     match idx {
@@ -1400,6 +1403,7 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
     let displays = state.engine.displays.lock().unwrap().clone();
     let mic_devices = state.engine.mic_devices.lock().unwrap().clone();
     let active_mic_name = state.engine.active_mic_name.lock().unwrap().clone();
+    let active_desk_label = state.engine.active_desktop_audio_label.lock().unwrap().clone();
     let gpu_name = state.engine.gpu_name.lock().unwrap().clone();
     let cap_mode = state.engine.capture_mode_status.lock().unwrap().clone();
     let pipe_status = state.engine.video_pipeline_status.lock().unwrap().clone();
@@ -1696,6 +1700,7 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
             brush,
             d2d,
             &cfg,
+            &active_desk_label,
             &mic_devices,
             &active_mic_name,
             running,
@@ -2016,6 +2021,7 @@ unsafe fn paint_tab_audio(
     brush: &ID2D1SolidColorBrush,
     d2d: &D2DResources,
     cfg: &crate::config::ReplayConfig,
+    active_desk_label: &str,
     mic_devices: &[crate::audio::AudioInputDevice],
     active_mic_name: &str,
     running: bool,
@@ -2026,11 +2032,16 @@ unsafe fn paint_tab_audio(
 ) {
     let dim_alpha = if running { COL_TEXT_DIM } else { COL_TEXT };
 
-    // Card 1: Audio Desktop
-    let c1 = RectF::new(20.0, 214.0, 640.0, 110.0);
+    // Card 1: Audio Desktop + Sumber Audio (Semua Desktop vs Hanya Game Aktif)
+    let c1 = RectF::new(20.0, 210.0, 640.0, 150.0);
     draw_card(rt, brush, c1, 8.0, COL_SURFACE, COL_BORDER);
-    draw_text(rt, brush, &d2d.fmt_title, RectF::new(36.0, 226.0, 380.0, 20.0), "Audio Desktop", COL_TEXT);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 247.0, 440.0, 16.0), "WASAPI Loopback 48 kHz · Game, Discord, Musik", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_title, RectF::new(36.0, 222.0, 380.0, 20.0), "Audio Desktop", COL_TEXT);
+    let desk_sub = if cfg.desktop_audio_mode == DesktopAudioMode::ActiveGameOnly {
+        "WASAPI Process Loopback 48 kHz · Khusus Game Aktif"
+    } else {
+        "WASAPI Loopback 48 kHz · Game, Discord, Musik"
+    };
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 242.0, 480.0, 16.0), desk_sub, COL_TEXT_MUTED);
     draw_toggle_switch(rt, brush, R_TOG_DESKTOP, cfg.record_desktop_audio, !running && R_TOG_DESKTOP.contains(hx, hy), running, COL_EMERALD);
 
     draw_slider(
@@ -2046,16 +2057,61 @@ unsafe fn paint_tab_audio(
         rt,
         brush,
         &d2d.fmt_right_reg,
-        RectF::new(584.0, 280.0, 58.0, 26.0),
+        RectF::new(584.0, 272.0, 58.0, 26.0),
         &format!("{}%", cfg.desktop_volume_percent),
         COL_TEXT,
     );
 
+    draw_hline(rt, brush, 36.0, 644.0, 307.0, COL_DIVIDER);
+    let (src_lbl, src_col) = if !cfg.record_desktop_audio {
+        ("SUMBER NONAKTIF".to_string(), COL_TEXT_DIM)
+    } else if running && cfg.desktop_audio_mode == DesktopAudioMode::ActiveGameOnly {
+        let txt = if active_desk_label.is_empty() {
+            "Menunggu game aktif...".to_string()
+        } else {
+            truncate_tail(active_desk_label, 24)
+        };
+        let col = if txt.starts_with("Game:") {
+            COL_EMERALD
+        } else {
+            COL_AMBER
+        };
+        (txt, col)
+    } else {
+        ("SUMBER AUDIO".to_string(), COL_TEXT_MUTED)
+    };
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 317.0, 164.0, 28.0), &src_lbl, src_col);
+
+    let mode_locked = running || !cfg.record_desktop_audio;
+    let desk_modes = [
+        (R_DAUDIO_ALL, DesktopAudioMode::AllDesktop, "Semua Audio Desktop"),
+        (R_DAUDIO_GAME, DesktopAudioMode::ActiveGameOnly, "Hanya Game Aktif (No Discord)"),
+    ];
+    for (mr, m_val, m_lbl) in desk_modes {
+        let active = cfg.desktop_audio_mode == m_val;
+        let hov = !mode_locked && mr.contains(hx, hy);
+        draw_chip(rt, brush, mr, 6.0, active, hov, mode_locked);
+        draw_text(
+            rt,
+            brush,
+            &d2d.fmt_center_small,
+            mr,
+            m_lbl,
+            if mode_locked {
+                if active { COL_TEXT_SUB } else { COL_TEXT_DIM }
+            } else if active {
+                COL_TEXT
+            } else {
+                COL_TEXT_SUB
+            },
+        );
+    }
+
     // Card 2: Audio Mikrofon + Device Selector
-    let c2 = RectF::new(20.0, 338.0, 640.0, 186.0);
+    let c2 = RectF::new(20.0, 372.0, 640.0, 182.0);
     draw_card(rt, brush, c2, 8.0, COL_SURFACE, COL_BORDER);
-    draw_text(rt, brush, &d2d.fmt_title, RectF::new(36.0, 350.0, 300.0, 20.0), "Audio Mikrofon", COL_TEXT);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 371.0, 420.0, 16.0), "Tercampur rapi dengan soft-limiter otomatis", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_title, RectF::new(36.0, 384.0, 300.0, 20.0), "Audio Mikrofon", COL_TEXT);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 404.0, 420.0, 16.0), "Tercampur rapi dengan soft-limiter otomatis", COL_TEXT_MUTED);
 
     let mute_hov = R_MUTE_PILL.contains(hx, hy);
     draw_card(
@@ -2110,15 +2166,15 @@ unsafe fn paint_tab_audio(
         rt,
         brush,
         &d2d.fmt_right_reg,
-        RectF::new(584.0, 404.0, 58.0, 26.0),
+        RectF::new(584.0, 438.0, 58.0, 26.0),
         &format!("{}%", cfg.mic_volume_percent),
         if cfg.mic_muted { COL_RED_HOVER } else { COL_TEXT },
     );
 
-    draw_hline(rt, brush, 36.0, 644.0, 442.0, COL_DIVIDER);
+    draw_hline(rt, brush, 36.0, 644.0, 474.0, COL_DIVIDER);
 
     let (mic_label, _, mic_avail) = resolved_mic_display(cfg, mic_devices, active_mic_name, running);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 452.0, 240.0, 16.0), "INPUT MIKROFON", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(36.0, 484.0, 240.0, 16.0), "INPUT MIKROFON", COL_TEXT_MUTED);
     let (mic_hint, mic_hint_col) = if running {
         ("Terkunci saat merekam", COL_AMBER)
     } else if !mic_avail {
@@ -2128,7 +2184,7 @@ unsafe fn paint_tab_audio(
     } else {
         ("Mengikuti Default Windows", COL_TEXT_MUTED)
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(300.0, 452.0, 344.0, 16.0), mic_hint, mic_hint_col);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(300.0, 484.0, 344.0, 16.0), mic_hint, mic_hint_col);
 
     let cmb_hov = !running && drop_open.is_none() && R_CMB_MIC.contains(hx, hy);
     let cmb_open = drop_open == Some(DropdownKind::MicInput);
@@ -2145,31 +2201,31 @@ unsafe fn paint_tab_audio(
         rt,
         brush,
         &d2d.fmt_reg,
-        RectF::new(48.0, 474.0, 560.0, 34.0),
+        RectF::new(48.0, 506.0, 560.0, 34.0),
         &disp_lbl,
         if !mic_avail { COL_RED_HOVER } else { dim_alpha },
     );
-    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(616.0, 474.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(616.0, 506.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
 
-    // Bottom minimalist notes (mirrors reference catalog checklist)
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 544.0, 300.0, 16.0), "SINKRONISASI AUDIO", COL_TEXT_MUTED);
-    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(20.0, 568.0, 18.0, 20.0), "✓", COL_EMERALD);
+    // Bottom minimalist notes
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 566.0, 300.0, 16.0), "SINKRONISASI AUDIO", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(20.0, 587.0, 18.0, 20.0), "✓", COL_EMERALD);
     draw_text(
         rt,
         brush,
         &d2d.fmt_small,
-        RectF::new(38.0, 569.0, 620.0, 18.0),
-        "Slider volume dapat digeser langsung (live) meskipun Instant Replay sedang berjalan.",
+        RectF::new(38.0, 588.0, 620.0, 18.0),
+        "Slider volume & mute mic dapat diubah langsung saat Replay berjalan.",
         COL_TEXT_SUB,
     );
-    draw_hline(rt, brush, 20.0, 660.0, 594.0, COL_DIVIDER);
-    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(20.0, 602.0, 18.0, 20.0), "✓", COL_EMERALD);
+    draw_hline(rt, brush, 20.0, 660.0, 610.0, COL_DIVIDER);
+    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(20.0, 615.0, 18.0, 20.0), "✓", COL_EMERALD);
     draw_text(
         rt,
         brush,
         &d2d.fmt_small,
-        RectF::new(38.0, 603.0, 620.0, 18.0),
-        "Input mikrofon di atas dipakai serentak untuk rekaman Instant Replay dan Voice Clip.",
+        RectF::new(38.0, 616.0, 620.0, 18.0),
+        "Mode Hanya Game Aktif memisahkan Discord/Spotify & tetap terkunci saat Alt-Tab.",
         COL_TEXT_SUB,
     );
 }
@@ -2186,7 +2242,7 @@ unsafe fn paint_tab_system(
     hx: f32,
     hy: f32,
 ) {
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 208.0, 340.0, 16.0), "GLOBAL SHORTCUT — KLIK SLOT UNTUK REKAM", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 204.0, 340.0, 15.0), "GLOBAL SHORTCUT — KLIK SLOT UNTUK REKAM", COL_TEXT_MUTED);
     let (mode_txt, mode_col) = if capturing.is_some() {
         ("Tekan kombinasi tombol (Esc batal)", COL_AMBER)
     } else if cfg.matching_hotkey_preset().is_none() {
@@ -2194,7 +2250,7 @@ unsafe fn paint_tab_system(
     } else {
         ("Preset Standar", COL_TEXT_MUTED)
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(380.0, 208.0, 280.0, 16.0), mode_txt, mode_col);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(380.0, 204.0, 280.0, 15.0), mode_txt, mode_col);
 
     let live_mods = if capturing.is_some() {
         current_async_hotkey_mods()
@@ -2223,7 +2279,7 @@ unsafe fn paint_tab_system(
             rt,
             brush,
             &d2d.fmt_small,
-            RectF::new(r.l + 12.0, r.t + 6.0, 158.0, 16.0),
+            RectF::new(r.l + 12.0, r.t + 5.0, 158.0, 15.0),
             slot.title(),
             if is_cap { COL_AMBER } else { COL_TEXT_MUTED },
         );
@@ -2242,7 +2298,7 @@ unsafe fn paint_tab_system(
             );
         }
 
-        let val_r = RectF::new(r.l + 12.0, r.t + 25.0, r.r - r.l - 24.0, 22.0);
+        let val_r = RectF::new(r.l + 12.0, r.t + 22.0, r.r - r.l - 24.0, 21.0);
         let (val_str, val_col) = if is_cap {
             (format_modifier_preview(live_mods), COL_AMBER)
         } else if binding.is_enabled() {
@@ -2262,7 +2318,7 @@ unsafe fn paint_tab_system(
         draw_text(rt, brush, &d2d.fmt_bold, val_r, &val_str, val_col);
     }
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 288.0, 86.0, 18.0), "Preset Cepat:", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 278.0, 86.0, 17.0), "Preset Cepat:", COL_TEXT_MUTED);
     let active_preset = cfg.matching_hotkey_preset();
     let presets = [
         (R_HK_PRESET_0, HotkeyPresetType::CtrlShiftF9F10, "Ctrl+Shift+F9/F10/M"),
@@ -2282,15 +2338,15 @@ unsafe fn paint_tab_system(
             if active { COL_TEXT } else { COL_TEXT_SUB },
         );
     }
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(484.0, 288.0, 176.0, 18.0), "Ctrl / Shift / Alt / Win", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(484.0, 278.0, 176.0, 17.0), "Ctrl / Shift / Alt / Win", COL_TEXT_MUTED);
 
-    draw_hline(rt, brush, 20.0, 660.0, 317.0, COL_DIVIDER);
+    draw_hline(rt, brush, 20.0, 660.0, 305.0, COL_DIVIDER);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 326.0, 300.0, 16.0), "FOLDER PENYIMPANAN VIDEO MP4", COL_TEXT_MUTED);
-    let path_box = RectF::new(20.0, 344.0, 516.0, 30.0);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 312.0, 300.0, 15.0), "FOLDER PENYIMPANAN VIDEO MP4", COL_TEXT_MUTED);
+    let path_box = RectF::new(20.0, 329.0, 516.0, 28.0);
     draw_card(rt, brush, path_box, 6.0, COL_SURFACE, COL_BORDER);
     let out_disp = compact_path_label(&cfg.output_folder, 66);
-    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 344.0, 492.0, 30.0), &out_disp, COL_TEXT_SUB);
+    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 329.0, 492.0, 28.0), &out_disp, COL_TEXT_SUB);
 
     let br_hov = R_BTN_BROWSE.contains(hx, hy);
     draw_button(rt, brush, R_BTN_BROWSE, 6.0, BtnStyle::Secondary, br_hov, false);
@@ -2301,7 +2357,7 @@ unsafe fn paint_tab_system(
         rt,
         brush,
         &d2d.fmt_small,
-        RectF::new(20.0, 381.0, 290.0, 16.0),
+        RectF::new(20.0, 363.0, 290.0, 15.0),
         "FORMAT NAMA KLIP & FOLDER ({game} {date} {time})",
         COL_TEXT_MUTED,
     );
@@ -2323,7 +2379,7 @@ unsafe fn paint_tab_system(
         rt,
         brush,
         &d2d.fmt_right_small,
-        RectF::new(312.0, 381.0, 348.0, 16.0),
+        RectF::new(312.0, 363.0, 348.0, 15.0),
         &preview_txt,
         COL_EMERALD,
     );
@@ -2345,7 +2401,7 @@ unsafe fn paint_tab_system(
 
     let default_temp = crate::config::ReplayConfig::default_temp_folder();
     let is_custom_temp = cfg.temp_folder.trim() != default_temp;
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 434.0, 360.0, 16.0), "FOLDER TEMP BUFFER (MODE DISK)", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 411.0, 360.0, 15.0), "FOLDER TEMP BUFFER (MODE DISK)", COL_TEXT_MUTED);
     let (temp_hint, temp_hint_col) = if running {
         ("Terkunci saat Replay aktif", COL_AMBER)
     } else if is_custom_temp {
@@ -2353,9 +2409,9 @@ unsafe fn paint_tab_system(
     } else {
         ("Default Windows %TEMP%", COL_TEXT_MUTED)
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 434.0, 260.0, 16.0), temp_hint, temp_hint_col);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 411.0, 260.0, 15.0), temp_hint, temp_hint_col);
 
-    let temp_box = RectF::new(20.0, 452.0, 438.0, 30.0);
+    let temp_box = RectF::new(20.0, 428.0, 438.0, 28.0);
     draw_card(
         rt,
         brush,
@@ -2369,7 +2425,7 @@ unsafe fn paint_tab_system(
         rt,
         brush,
         &d2d.fmt_reg,
-        RectF::new(32.0, 452.0, 414.0, 30.0),
+        RectF::new(32.0, 428.0, 414.0, 28.0),
         &temp_disp,
         if running { COL_TEXT_DIM } else { COL_TEXT_SUB },
     );
@@ -2397,20 +2453,21 @@ unsafe fn paint_tab_system(
         if trst_active { COL_TEXT_SUB } else { COL_TEXT_DIM },
     );
 
-    draw_hline(rt, brush, 20.0, 660.0, 491.0, COL_DIVIDER);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 498.0, 300.0, 16.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
+    draw_hline(rt, brush, 20.0, 660.0, 464.0, COL_DIVIDER);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 470.0, 300.0, 15.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
 
     let rows = [
-        (R_TOG_TRAY, 516.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
+        (R_TOG_STARTUP, 487.0, "Jalankan otomatis saat Windows menyala (masuk ke System Tray)", cfg.run_on_startup),
+        (R_TOG_TRAY, 517.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
         (R_TOG_BEEP, 547.0, "Bunyi Beep konfirmasi saat klip replay tersimpan", cfg.play_sound_on_save),
-        (R_TOG_FOCUS, 578.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
-        (R_TOG_AUTO_UPDATE, 609.0, "Periksa pembaruan GitHub Releases otomatis saat dibuka", cfg.auto_check_updates),
+        (R_TOG_FOCUS, 577.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
+        (R_TOG_AUTO_UPDATE, 607.0, "Periksa pembaruan GitHub Releases otomatis saat dibuka", cfg.auto_check_updates),
     ];
     for (idx, (tog_r, y, title, val)) in rows.into_iter().enumerate() {
-        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 28.0), title, COL_TEXT_SUB);
+        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 26.0), title, COL_TEXT_SUB);
         draw_toggle_switch(rt, brush, tog_r, val, tog_r.contains(hx, hy), false, COL_EMERALD);
-        if idx < 3 {
-            draw_hline(rt, brush, 20.0, 660.0, y + 29.0, c_rgb(24, 24, 29));
+        if idx < 4 {
+            draw_hline(rt, brush, 20.0, 660.0, y + 28.0, c_rgb(24, 24, 29));
         }
     }
 }
@@ -3034,11 +3091,14 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
             }
         }
         1 => {
+            let desk_on = state.engine.config.lock().unwrap().record_desktop_audio;
             if R_SLD_DESKTOP.contains(x, y)
                 || R_SLD_MIC.contains(x, y)
                 || R_MUTE_PILL.contains(x, y)
                 || (!running
                     && (R_TOG_DESKTOP.contains(x, y)
+                        || (desk_on
+                            && (R_DAUDIO_ALL.contains(x, y) || R_DAUDIO_GAME.contains(x, y)))
                         || R_TOG_MIC.contains(x, y)
                         || R_CMB_MIC.contains(x, y)))
             {
@@ -3060,6 +3120,7 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
                 || R_BTN_BROWSE.contains(x, y)
                 || (!running && R_BTN_TEMP_BROWSE.contains(x, y))
                 || (!running && is_custom_temp && R_BTN_TEMP_RESET.contains(x, y))
+                || R_TOG_STARTUP.contains(x, y)
                 || R_TOG_TRAY.contains(x, y)
                 || R_TOG_BEEP.contains(x, y)
                 || R_TOG_FOCUS.contains(x, y)
@@ -3323,6 +3384,18 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
                 let mut cfg = state.engine.config.lock().unwrap();
                 cfg.record_desktop_audio = !cfg.record_desktop_audio;
                 cfg.save();
+            } else if !running && R_DAUDIO_ALL.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                if cfg.record_desktop_audio {
+                    cfg.desktop_audio_mode = DesktopAudioMode::AllDesktop;
+                    cfg.save();
+                }
+            } else if !running && R_DAUDIO_GAME.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                if cfg.record_desktop_audio {
+                    cfg.desktop_audio_mode = DesktopAudioMode::ActiveGameOnly;
+                    cfg.save();
+                }
             } else if !running && R_TOG_MIC.contains(x, y) {
                 let mut cfg = state.engine.config.lock().unwrap();
                 cfg.record_microphone = !cfg.record_microphone;
@@ -3433,6 +3506,13 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
                 let mut cfg = state.engine.config.lock().unwrap();
                 if cfg.temp_folder != def {
                     cfg.temp_folder = def;
+                    cfg.save();
+                }
+            } else if R_TOG_STARTUP.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                let next = !cfg.run_on_startup;
+                if crate::config::set_run_on_startup(next) {
+                    cfg.run_on_startup = next;
                     cfg.save();
                 }
             } else if R_TOG_TRAY.contains(x, y) {
@@ -3571,7 +3651,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     capturing_hotkey: None,
                     caret_tick: 0,
                     fast_timer_active: false,
-                    timer_interval_ms: 250,
+                    timer_interval_ms: 0,
                     hotkey_warning: String::new(),
                     tray_added: false,
                     last_process_ram_mb: query_process_ram_mb(),
@@ -3587,7 +3667,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if auto_upd {
                     state.engine.updater.check_for_updates_async(false);
                 }
-                let _ = SetTimer(hwnd, TIMER_UPDATE_ID, 250, None);
                 SetWindowLongPtrW(hwnd, GWL_USERDATA, Box::into_raw(state) as isize);
             }
             LRESULT(0)
@@ -3983,7 +4062,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-pub fn run(engine: Arc<ReplayEngine>) {
+pub fn run(engine: Arc<ReplayEngine>, start_minimized: bool) {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         let class_name = wide_null("NVLiteReplayRustVoiceRecogMainWnd");
@@ -4042,7 +4121,7 @@ pub fn run(engine: Arc<ReplayEngine>) {
         )
         .unwrap_or(HWND::default());
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if start_minimized { SW_HIDE } else { SW_SHOW });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

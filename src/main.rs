@@ -338,16 +338,19 @@ fn main() {
     }
 
     let update_notice = updater::handle_update_startup_args(&args);
+    let start_minimized = args.iter().any(|a| a.eq_ignore_ascii_case("--minimized"));
 
     unsafe {
         let mutex_name = wide_null("Global\\NVLiteReplayRustVoiceRecog_SingleInstance_Mutex");
         let _mutex = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()));
         if windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS {
-            let cls = wide_null("NVLiteReplayRustVoiceRecogMainWnd");
-            if let Ok(existing) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
-                if !existing.0.is_null() {
-                    let _ = ShowWindow(existing, SW_RESTORE);
-                    let _ = SetForegroundWindow(existing);
+            if !start_minimized {
+                let cls = wide_null("NVLiteReplayRustVoiceRecogMainWnd");
+                if let Ok(existing) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
+                    if !existing.0.is_null() {
+                        let _ = ShowWindow(existing, SW_RESTORE);
+                        let _ = SetForegroundWindow(existing);
+                    }
                 }
             }
             CoUninitialize();
@@ -360,7 +363,7 @@ fn main() {
     if let Some(msg) = update_notice {
         engine.raise_status(msg);
     }
-    ui::run(engine);
+    ui::run(engine, start_minimized);
 
     unsafe {
         CoUninitialize();

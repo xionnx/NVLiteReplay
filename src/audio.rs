@@ -1,16 +1,23 @@
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+use windows::core::{Interface, GUID, HRESULT, PCWSTR, PROPVARIANT, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{E_NOINTERFACE, S_OK};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioCaptureClient, IAudioClient,
-    IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE,
+    eCapture, eConsole, eMultimedia, eRender, ActivateAudioInterfaceAsync, EDataFlow, ERole,
+    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Vtbl, IAudioCaptureClient, IAudioClient, IMMDevice,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Vtbl, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    DEVICE_STATE, DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -22,6 +29,7 @@ const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 const FIFO_CAPACITY: usize = 192_000; // 96,000 stereo frames = 2.0 sec @ 48 kHz
+const WAVE_FORMAT_PCM_TAG: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT_TAG: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE_TAG: u16 = 0xFFFE;
 
@@ -307,6 +315,102 @@ impl Drop for AudioEndpointMonitor {
     }
 }
 
+#[repr(C)]
+struct RawPropVariantBlob {
+    vt: u16, // 65 = VT_BLOB
+    w_reserved1: u16,
+    w_reserved2: u16,
+    w_reserved3: u16,
+    cb_size: u32,
+    _pad: u32,
+    p_blob_data: *mut u8,
+}
+
+#[repr(C)]
+struct ComActivateHandler {
+    vtable: *const IActivateAudioInterfaceCompletionHandler_Vtbl,
+    ref_count: AtomicU32,
+    done: Arc<(Mutex<Option<windows::core::Result<IAudioClient>>>, Condvar)>,
+}
+
+static ACTIVATE_HANDLER_VTABLE: IActivateAudioInterfaceCompletionHandler_Vtbl =
+    IActivateAudioInterfaceCompletionHandler_Vtbl {
+        base__: windows::core::IUnknown_Vtbl {
+            QueryInterface: activate_query_interface,
+            AddRef: activate_add_ref,
+            Release: activate_release,
+        },
+        ActivateCompleted: activate_completed,
+    };
+
+unsafe extern "system" fn activate_query_interface(
+    this: *mut c_void,
+    iid: *const GUID,
+    interface: *mut *mut c_void,
+) -> HRESULT {
+    if interface.is_null() || iid.is_null() {
+        return E_NOINTERFACE;
+    }
+    let id = *iid;
+    if id == windows::core::IUnknown::IID
+        || id == IActivateAudioInterfaceCompletionHandler::IID
+        || id == IID_IAGILE_OBJECT
+    {
+        *interface = this;
+        activate_add_ref(this);
+        return S_OK;
+    }
+    *interface = null_mut();
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn activate_add_ref(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const ComActivateHandler);
+    obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn activate_release(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const ComActivateHandler);
+    let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this as *mut ComActivateHandler));
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn activate_completed(
+    this: *mut c_void,
+    operation: *mut c_void,
+) -> HRESULT {
+    let obj = &*(this as *const ComActivateHandler);
+    let res = if operation.is_null() {
+        Err(windows::core::Error::from(HRESULT(-2147467261i32)))
+    } else {
+        let op = ManuallyDrop::new(IActivateAudioInterfaceAsyncOperation::from_raw(operation));
+        let mut hr = HRESULT(0);
+        let mut unk: Option<windows::core::IUnknown> = None;
+        match op.GetActivateResult(&mut hr, &mut unk) {
+            Ok(()) => {
+                if hr.is_err() {
+                    Err(windows::core::Error::from(hr))
+                } else if let Some(u) = unk {
+                    u.cast::<IAudioClient>()
+                } else {
+                    Err(windows::core::Error::from(HRESULT(-2147467259i32)))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    if let Ok(mut guard) = obj.done.0.lock() {
+        *guard = Some(res);
+        obj.done.1.notify_all();
+    }
+    S_OK
+}
+
 pub struct WasapiStream {
     audio_client: Option<IAudioClient>,
     silence_client: Option<IAudioClient>,
@@ -335,6 +439,7 @@ pub struct WasapiStream {
     last_right: f32,
     initialized: bool,
     device_invalidated: bool,
+    process_loopback_pid: Option<u32>,
     active_device_id: String,
     active_device_name: String,
 }
@@ -366,6 +471,7 @@ impl WasapiStream {
             last_right: 0.0,
             initialized: false,
             device_invalidated: false,
+            process_loopback_pid: None,
             active_device_id: String::new(),
             active_device_name: String::new(),
         }
@@ -406,8 +512,23 @@ impl WasapiStream {
         &self.active_device_name
     }
 
+    #[cfg(test)]
+    pub fn active_process_loopback_pid(&self) -> Option<u32> {
+        self.process_loopback_pid
+    }
+
+    pub fn stop_and_release(&mut self) {
+        unsafe {
+            self.release_clients();
+        }
+        self.device_invalidated = false;
+        self.active_device_id.clear();
+        self.active_device_name.clear();
+    }
+
     unsafe fn release_clients(&mut self) {
         self.initialized = false;
+        self.process_loopback_pid = None;
         if let Some(ref c) = self.audio_client {
             let _ = c.Stop();
         }
@@ -420,6 +541,163 @@ impl WasapiStream {
         if !self.mix_format_ptr.is_null() {
             CoTaskMemFree(Some(self.mix_format_ptr as *const _));
             self.mix_format_ptr = null_mut();
+        }
+    }
+
+    /// Initializes Per-Application WASAPI Process Loopback (`VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`)
+    /// capturing audio exclusively from `target_pid` and its child process tree.
+    pub fn initialize_process_loopback(&mut self, target_pid: u32, label: &str) -> bool {
+        if target_pid == 0 {
+            return false;
+        }
+        let had_fifo = self.fifo_count > 0;
+        self.device_invalidated = false;
+        self.active_device_id.clear();
+        self.active_device_name.clear();
+        self.resample_phase = 0.0;
+        self.last_left = 0.0;
+        self.last_right = 0.0;
+
+        if self.fifo_count > 1200 * 2 {
+            let mut drop_count = self.fifo_count - (1200 * 2);
+            if drop_count % 2 != 0 {
+                drop_count -= 1;
+            }
+            self.fifo_read = (self.fifo_read + drop_count) % FIFO_CAPACITY;
+            self.fifo_count -= drop_count;
+        }
+
+        unsafe {
+            self.release_clients();
+
+            let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+                ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+                Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                    ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                        TargetProcessId: target_pid,
+                        ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                    },
+                },
+            };
+
+            let raw_pv = RawPropVariantBlob {
+                vt: 65, // VT_BLOB
+                w_reserved1: 0,
+                w_reserved2: 0,
+                w_reserved3: 0,
+                cb_size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                _pad: 0,
+                p_blob_data: &mut params as *mut _ as *mut u8,
+            };
+
+            let done = Arc::new((Mutex::new(None), Condvar::new()));
+            let raw_handler = Box::into_raw(Box::new(ComActivateHandler {
+                vtable: &ACTIVATE_HANDLER_VTABLE,
+                ref_count: AtomicU32::new(1),
+                done: Arc::clone(&done),
+            }));
+            let handler =
+                IActivateAudioInterfaceCompletionHandler::from_raw(raw_handler as *mut c_void);
+
+            let Ok(_op) = ActivateAudioInterfaceAsync(
+                VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                &IAudioClient::IID,
+                Some(&raw_pv as *const RawPropVariantBlob as *const PROPVARIANT),
+                &handler,
+            ) else {
+                return false;
+            };
+
+            let client_opt = {
+                let (lock, cv) = &*done;
+                let Ok(guard) = lock.lock() else {
+                    return false;
+                };
+                match cv.wait_timeout_while(guard, Duration::from_millis(1500), |g| g.is_none()) {
+                    Ok((mut g, _)) => g.take(),
+                    Err(_) => None,
+                }
+            };
+
+            let Some(Ok(audio_client)) = client_opt else {
+                return false;
+            };
+
+            let wfx_float = WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_IEEE_FLOAT_TAG,
+                nChannels: 2,
+                nSamplesPerSec: 48_000,
+                nAvgBytesPerSec: 384_000,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: 0,
+            };
+            let wfx_pcm16 = WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_PCM_TAG,
+                nChannels: 2,
+                nSamplesPerSec: 48_000,
+                nAvgBytesPerSec: 192_000,
+                nBlockAlign: 4,
+                wBitsPerSample: 16,
+                cbSize: 0,
+            };
+
+            let attempts = [
+                (wfx_float, AUDCLNT_STREAMFLAGS_LOOPBACK, 32u16, 8usize, true),
+                (wfx_pcm16, AUDCLNT_STREAMFLAGS_LOOPBACK, 16u16, 4usize, false),
+                (
+                    wfx_pcm16,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                    16u16,
+                    4usize,
+                    false,
+                ),
+            ];
+
+            let mut chosen: Option<(u16, usize, bool)> = None;
+            for (fmt, flags, bits, align, is_flt) in attempts {
+                if audio_client
+                    .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, &fmt, None)
+                    .is_ok()
+                {
+                    chosen = Some((bits, align, is_flt));
+                    break;
+                }
+            }
+            let Some((bits, align, is_flt)) = chosen else {
+                return false;
+            };
+
+            let Ok(capture_client): windows::core::Result<IAudioCaptureClient> =
+                audio_client.GetService()
+            else {
+                return false;
+            };
+
+            if audio_client.Start().is_err() {
+                return false;
+            }
+
+            if !had_fifo {
+                self.push_stereo_sample(0.0, 0.0, 1680);
+            } else if self.fifo_count < 720 * 2 {
+                self.push_stereo_sample(0.0, 0.0, 720);
+            }
+
+            self.sample_rate = 48_000;
+            self.channels = 2;
+            self.bits_per_sample = bits;
+            self.block_align = align;
+            self.is_float = is_flt;
+            self.audio_client = Some(audio_client);
+            self.capture_client = Some(capture_client);
+            self.process_loopback_pid = Some(target_pid);
+            self.active_device_id = format!("pid:{}", target_pid);
+            self.active_device_name = label.to_string();
+            self.initialized = true;
+            true
         }
     }
 
@@ -835,6 +1113,33 @@ mod tests {
                 assert!(loop_stream.is_available());
             }
             drop(loop_stream);
+
+            if need_uninit {
+                CoUninitialize();
+            }
+        }
+    }
+
+    #[test]
+    fn process_loopback_activates_and_drains_cleanly() {
+        assert_eq!(
+            std::mem::size_of::<RawPropVariantBlob>(),
+            std::mem::size_of::<PROPVARIANT>()
+        );
+        unsafe {
+            let need_uninit = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            let mut stream = WasapiStream::new();
+            let pid = std::process::id();
+            assert!(
+                stream.initialize_process_loopback(pid, "SelfTest"),
+                "Per-application process loopback should succeed on Windows 11 Build 26200"
+            );
+            assert!(stream.is_available());
+            assert_eq!(stream.active_process_loopback_pid(), Some(pid));
+            stream.drain_packets();
+            stream.stop_and_release();
+            assert!(!stream.is_available());
+            assert_eq!(stream.active_process_loopback_pid(), None);
 
             if need_uninit {
                 CoUninitialize();
