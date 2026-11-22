@@ -297,11 +297,23 @@ pub struct ReplayConfig {
 
     pub output_folder: String,
     pub temp_folder: String,
+    pub clip_name_template: String,
+    pub game_name_map: String,
     pub minimize_to_tray_on_close: bool,
     pub play_sound_on_save: bool,
     pub suppress_notifications_in_game: bool,
     pub auto_check_updates: bool,
 }
+
+pub const DEFAULT_CLIP_NAME_TEMPLATE: &str = "{game}/Replay_{date}_{time}";
+
+pub const DEFAULT_GAME_NAME_MAP: &str =
+    "msedge.exe=Browser;chrome.exe=Browser;firefox.exe=Browser;brave.exe=Browser;\
+     opera.exe=Browser;vivaldi.exe=Browser;explorer.exe=Desktop;\
+     valorant-win64-shipping.exe=Valorant;cs2.exe=Counter-Strike 2;dota2.exe=Dota 2;\
+     r5apex.exe=Apex Legends;overwatch.exe=Overwatch 2;\
+     fortniteclient-win64-shipping.exe=Fortnite;genshinimpact.exe=Genshin Impact;\
+     robloxplayerbeta.exe=Roblox";
 
 impl Default for ReplayConfig {
     fn default() -> Self {
@@ -341,6 +353,8 @@ impl Default for ReplayConfig {
             voice_cooldown_seconds: 8,
             output_folder,
             temp_folder,
+            clip_name_template: DEFAULT_CLIP_NAME_TEMPLATE.to_string(),
+            game_name_map: DEFAULT_GAME_NAME_MAP.to_string(),
             minimize_to_tray_on_close: true,
             play_sound_on_save: true,
             suppress_notifications_in_game: true,
@@ -574,6 +588,18 @@ impl ReplayConfig {
                         val.to_string()
                     };
                 }
+                "ClipNameTemplate" => {
+                    self.clip_name_template = if val.is_empty() {
+                        DEFAULT_CLIP_NAME_TEMPLATE.to_string()
+                    } else {
+                        val.to_string()
+                    };
+                }
+                "GameNameMap" => {
+                    if !val.is_empty() {
+                        self.game_name_map = val.to_string();
+                    }
+                }
                 "MinimizeToTrayOnClose" => {
                     if let Ok(b) = parse_bool(val) {
                         self.minimize_to_tray_on_close = b;
@@ -637,6 +663,8 @@ impl ReplayConfig {
              VoiceCooldownSeconds={}\n\
              OutputFolder={}\n\
              TempFolder={}\n\
+             ClipNameTemplate={}\n\
+             GameNameMap={}\n\
              MinimizeToTrayOnClose={}\n\
              PlaySoundOnSave={}\n\
              SuppressNotificationsInGame={}\n\
@@ -666,6 +694,8 @@ impl ReplayConfig {
             self.voice_cooldown_seconds,
             self.output_folder,
             self.temp_folder,
+            self.clip_name_template,
+            self.game_name_map,
             self.minimize_to_tray_on_close,
             self.play_sound_on_save,
             self.suppress_notifications_in_game,
@@ -673,6 +703,240 @@ impl ReplayConfig {
         );
         let _ = fs::write(Self::config_file_path(), content);
     }
+}
+
+/// Looks up a friendly game/app name for `exe_name_or_path` (e.g. `msedge.exe` -> `Browser`)
+/// in `custom_map`, falling back to `DEFAULT_GAME_NAME_MAP`.
+/// Supports `;`, `,`, or newline-separated rules with `=`, `->`, or `:` key/value separators.
+pub fn lookup_custom_game_name(custom_map: &str, exe_name_or_path: &str) -> Option<String> {
+    let file_name = Path::new(exe_name_or_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(exe_name_or_path)
+        .trim();
+    if file_name.is_empty() {
+        return None;
+    }
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+
+    for source in [custom_map, DEFAULT_GAME_NAME_MAP] {
+        for entry in source.split([';', ',', '\n', '\r']) {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let pair = trimmed
+                .split_once("->")
+                .or_else(|| trimmed.split_once('='))
+                .or_else(|| trimmed.split_once(':'));
+            let Some((raw_k, raw_v)) = pair else {
+                continue;
+            };
+            let k = raw_k.trim();
+            let v = raw_v.trim();
+            if k.is_empty() || v.is_empty() {
+                continue;
+            }
+            let k_stem = k
+                .strip_suffix(".exe")
+                .or_else(|| k.strip_suffix(".EXE"))
+                .unwrap_or(k);
+            if k.eq_ignore_ascii_case(file_name) || k_stem.eq_ignore_ascii_case(stem) {
+                let clean = sanitize_path_component(v, "");
+                if !clean.is_empty() {
+                    return Some(clean);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cleans an executable filename or stem into a readable game/app folder name
+/// (e.g. `VALORANT-Win64-Shipping.exe` -> `Valorant`, `my_cool_game_x64.exe` -> `my cool game`).
+pub fn clean_exe_stem_name(exe_name_or_path: &str) -> String {
+    let file_name = Path::new(exe_name_or_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(exe_name_or_path)
+        .trim();
+    let mut s = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name)
+        .to_string();
+
+    for suffix in [
+        "-Win64-Shipping",
+        "-WinGDK-Shipping",
+        "-Win32-Shipping",
+        "_Win64_Shipping",
+        "-Win64",
+        "_x64",
+        "-x64",
+        "_dx12",
+        "_dx11",
+    ] {
+        if s.len() > suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
+            s.truncate(s.len() - suffix.len());
+        }
+    }
+
+    let s = s.replace('_', " ");
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return "Desktop".to_string();
+    }
+
+    // If a single word is ALL-UPPERCASE (>4 chars, e.g. "VALORANT") or all-lowercase ("valorant"),
+    // convert to Title Case ("Valorant").
+    let is_all_upper = trimmed.len() > 4
+        && trimmed.chars().all(|c| !c.is_ascii_lowercase())
+        && trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let is_all_lower = trimmed.chars().all(|c| !c.is_ascii_uppercase())
+        && trimmed.chars().any(|c| c.is_ascii_lowercase());
+
+    let formatted = if is_all_upper || is_all_lower {
+        trimmed
+            .split_whitespace()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        trimmed.to_string()
+    };
+
+    sanitize_path_component(&formatted, "Desktop")
+}
+
+/// Sanitizes a single Windows path component (folder or filename stem), stripping
+/// illegal characters (`< > : " / \ | ? *`, control chars, `®`, `™`) and reserved names.
+pub fn sanitize_path_component(raw: &str, fallback: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut prev_space = false;
+    for ch in raw.chars() {
+        if ch == '®' || ch == '™' || ch.is_control() {
+            continue;
+        }
+        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if !prev_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !prev_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                prev_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            prev_space = false;
+        }
+    }
+
+    let trimmed = cleaned.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return fallback.to_string();
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let is_reserved = matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if is_reserved {
+        return fallback.to_string();
+    }
+
+    trimmed.chars().take(64).collect::<String>().trim().to_string()
+}
+
+/// Expands `{game}`, `{date}`, and `{time}` placeholders inside `template` into a sanitized
+/// relative path (without `.mp4` suffix), supporting `/` or `\` subdirectory separators.
+pub fn format_clip_relative_path(
+    template: &str,
+    game_name: &str,
+    date_str: &str,
+    time_str: &str,
+) -> PathBuf {
+    let tpl = if template.trim().is_empty() {
+        DEFAULT_CLIP_NAME_TEMPLATE
+    } else {
+        template.trim()
+    };
+    let safe_game = sanitize_path_component(game_name, "Desktop");
+    let safe_date = sanitize_path_component(date_str, "2026-01-01");
+    let safe_time = sanitize_path_component(time_str, "00-00-00");
+
+    let expanded = tpl
+        .replace("{game}", &safe_game)
+        .replace("{GAME}", &safe_game)
+        .replace("{date}", &safe_date)
+        .replace("{DATE}", &safe_date)
+        .replace("{time}", &safe_time)
+        .replace("{TIME}", &safe_time);
+
+    let mut parts: Vec<String> = expanded
+        .split(['/', '\\'])
+        .map(|seg| sanitize_path_component(seg, ""))
+        .filter(|seg| !seg.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        parts.push(format!("Replay_{}_{}", safe_date, safe_time));
+    }
+
+    if let Some(last) = parts.last_mut() {
+        if last.len() > 4 && last[last.len() - 4..].eq_ignore_ascii_case(".mp4") {
+            last.truncate(last.len() - 4);
+        }
+        let cleaned_last = sanitize_path_component(last, "");
+        if cleaned_last.is_empty() {
+            *last = format!("Replay_{}_{}", safe_date, safe_time);
+        } else {
+            *last = cleaned_last;
+        }
+    }
+
+    let mut rel = PathBuf::new();
+    for p in parts {
+        rel.push(p);
+    }
+    rel
 }
 
 fn parse_bool(s: &str) -> Result<bool, ()> {
@@ -832,5 +1096,70 @@ mod tests {
 
         cfg.apply_ini_str("AutoCheckUpdates=1\n");
         assert!(cfg.auto_check_updates);
+    }
+
+    #[test]
+    fn clip_name_template_and_game_name_map_helpers() {
+        assert_eq!(
+            lookup_custom_game_name(DEFAULT_GAME_NAME_MAP, "msedge.exe"),
+            Some("Browser".to_string())
+        );
+        assert_eq!(
+            lookup_custom_game_name(
+                DEFAULT_GAME_NAME_MAP,
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            ),
+            Some("Browser".to_string())
+        );
+        assert_eq!(
+            lookup_custom_game_name(
+                "mygame.exe -> My Custom Game; msedge.exe -> Edge Browser",
+                "mygame.exe"
+            ),
+            Some("My Custom Game".to_string())
+        );
+        assert_eq!(
+            lookup_custom_game_name(
+                "mygame.exe -> My Custom Game; msedge.exe -> Edge Browser",
+                "msedge.exe"
+            ),
+            Some("Edge Browser".to_string())
+        );
+        assert_eq!(
+            clean_exe_stem_name(r"D:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"),
+            "Valorant"
+        );
+        assert_eq!(clean_exe_stem_name("Apex_x64.exe"), "Apex");
+
+        let rel = format_clip_relative_path(
+            "{game}/Replay_{date}_{time}",
+            "Valorant",
+            "2026-11-21",
+            "14-05-00",
+        );
+        assert_eq!(
+            rel,
+            PathBuf::from("Valorant").join("Replay_2026-11-21_14-05-00")
+        );
+
+        let flat = format_clip_relative_path(
+            "Replay_{date}_{time}",
+            "Valorant",
+            "2026-11-21",
+            "14-05-00",
+        );
+        assert_eq!(flat, PathBuf::from("Replay_2026-11-21_14-05-00"));
+
+        let mut cfg = ReplayConfig::default();
+        assert_eq!(cfg.clip_name_template, DEFAULT_CLIP_NAME_TEMPLATE);
+        cfg.apply_ini_str(
+            "ClipNameTemplate={game}/{game}_{date}_{time}\n\
+             GameNameMap=msedge.exe->Browser;custom.exe=CustomApp\n",
+        );
+        assert_eq!(cfg.clip_name_template, "{game}/{game}_{date}_{time}");
+        assert_eq!(
+            lookup_custom_game_name(&cfg.game_name_map, "custom.exe"),
+            Some("CustomApp".to_string())
+        );
     }
 }

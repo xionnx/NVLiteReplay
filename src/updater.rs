@@ -2,7 +2,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -362,6 +362,8 @@ fn perform_in_place_update(
         .and_then(|s| s.to_str())
         .unwrap_or("NVLiteReplayRustVoiceRecog.exe");
 
+    // Clean up any leftover .old / .update.tmp artifacts BEFORE creating the new download file!
+    cleanup_old_binaries_in_dir(exe_dir);
     let tmp_path = exe_dir.join(format!("{}.update.tmp", exe_name));
     let _ = fs::remove_file(&tmp_path);
 
@@ -437,22 +439,7 @@ fn perform_in_place_update(
     }
 
     let pid = unsafe { GetCurrentProcessId() };
-    cleanup_old_binaries_in_dir(exe_dir);
-    let mut backup_path = exe_dir.join(format!("{}.old", exe_name));
-    if backup_path.exists() && fs::remove_file(&backup_path).is_err() {
-        backup_path = exe_dir.join(format!("{}.{}.old", exe_name, pid));
-    }
-
-    if fs::rename(&current_exe, &backup_path).is_err() {
-        let _ = fs::remove_file(&tmp_path);
-        return Err("File .exe sedang dikunci Windows — silakan unduh manual via GitHub.".to_string());
-    }
-
-    if fs::rename(&tmp_path, &current_exe).is_err() {
-        let _ = fs::rename(&backup_path, &current_exe);
-        let _ = fs::remove_file(&tmp_path);
-        return Err("Gagal mengganti file aplikasi — perubahan dibatalkan aman.".to_string());
-    }
+    let backup_path = swap_downloaded_binary_in_place(&current_exe, &tmp_path, pid)?;
 
     if Command::new(&current_exe)
         .arg("--wait-pid")
@@ -463,13 +450,80 @@ fn perform_in_place_update(
         .is_err()
     {
         // Restore old binary cleanly if launching the new one failed immediately.
-        let _ = fs::rename(&current_exe, &tmp_path);
+        let _ = fs::remove_file(&current_exe);
         let _ = fs::rename(&backup_path, &current_exe);
         let _ = fs::remove_file(&tmp_path);
         return Err("Gagal menjalankan versi baru — versi lama dipulihkan.".to_string());
     }
 
     Ok(())
+}
+
+/// Atomically swaps `current_exe` with the verified downloaded `tmp_path` (`*.update.tmp`),
+/// retrying briefly or falling back to copy if Windows Defender holds a transient read handle.
+fn swap_downloaded_binary_in_place(
+    current_exe: &Path,
+    tmp_path: &Path,
+    pid: u32,
+) -> Result<PathBuf, String> {
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "Folder aplikasi tidak ditemukan.".to_string())?;
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("NVLiteReplayRustVoiceRecog.exe");
+
+    let mut backup_path = exe_dir.join(format!("{}.old", exe_name));
+    if backup_path.exists() && fs::remove_file(&backup_path).is_err() {
+        backup_path = exe_dir.join(format!("{}.{}.old", exe_name, pid));
+        let _ = fs::remove_file(&backup_path);
+    }
+
+    let mut moved_old = false;
+    for attempt in 0..4 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if fs::rename(current_exe, &backup_path).is_ok() {
+            moved_old = true;
+            break;
+        }
+    }
+    if !moved_old {
+        let _ = fs::remove_file(tmp_path);
+        return Err("File .exe sedang dikunci Windows — silakan unduh manual via GitHub.".to_string());
+    }
+
+    let mut installed_new = false;
+    for attempt in 0..6 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(60));
+        }
+        if fs::rename(tmp_path, current_exe).is_ok() {
+            installed_new = true;
+            break;
+        }
+    }
+    if !installed_new {
+        // Fallback: if antivirus/SmartScreen holds a shared read lock on tmp_path blocking MoveFile,
+        // copy the verified bytes to current_exe and remove tmp_path on best-effort.
+        if let Ok(copied) = fs::copy(tmp_path, current_exe) {
+            if copied >= MIN_VALID_EXE_BYTES || copied == fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0) {
+                let _ = fs::remove_file(tmp_path);
+                installed_new = true;
+            }
+        }
+    }
+
+    if !installed_new {
+        let _ = fs::remove_file(current_exe);
+        let _ = fs::rename(&backup_path, current_exe);
+        let _ = fs::remove_file(tmp_path);
+        return Err("Gagal mengganti file aplikasi — perubahan dibatalkan aman.".to_string());
+    }
+
+    Ok(backup_path)
 }
 
 /// Handles `--wait-pid` / `--updated-from` flags on relaunch after an in-place update
@@ -1286,6 +1340,42 @@ mod tests {
             notice.as_deref(),
             Some(format!("Berhasil diperbarui dari v1.0.2 ke v{}!", APP_VERSION).as_str())
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_place_binary_swap_replaces_exe_and_keeps_backup_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "NVLiteReplay_UpdateSwapTest_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cur_exe = dir.join("NVLiteReplayRustVoiceRecog.exe");
+        let stale_old = dir.join("NVLiteReplayRustVoiceRecog.exe.old");
+        let tmp_new = dir.join("NVLiteReplayRustVoiceRecog.exe.update.tmp");
+
+        fs::write(&cur_exe, b"OLD_BINARY_V1").unwrap();
+        fs::write(&stale_old, b"STALE_OLD").unwrap();
+
+        // Simulate perform_in_place_update sequence: cleanup BEFORE creating tmp_new, then swap!
+        cleanup_old_binaries_in_dir(&dir);
+        fs::write(&tmp_new, b"NEW_BINARY_V2").unwrap();
+
+        let backup = swap_downloaded_binary_in_place(&cur_exe, &tmp_new, 12345)
+            .expect("swap_downloaded_binary_in_place must succeed");
+        assert!(cur_exe.exists(), "Replaced executable must exist");
+        assert!(!tmp_new.exists(), "Temporary update file must be moved/removed");
+        assert!(backup.exists(), "Backup .old file must exist until relaunch cleanup");
+        assert_eq!(fs::read(&cur_exe).unwrap(), b"NEW_BINARY_V2");
+        assert_eq!(fs::read(&backup).unwrap(), b"OLD_BINARY_V1");
+
+        // Simulate relaunch cleanup
+        cleanup_old_binaries_in_dir(&dir);
+        assert!(!backup.exists(), "Backup .old file must be removed on relaunch");
+        assert_eq!(fs::read(&cur_exe).unwrap(), b"NEW_BINARY_V2");
 
         let _ = fs::remove_dir_all(&dir);
     }

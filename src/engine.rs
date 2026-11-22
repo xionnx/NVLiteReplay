@@ -1,5 +1,6 @@
 use std::fs;
 use std::mem::ManuallyDrop;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -7,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, GUID, HSTRING, PCWSTR, VARIANT};
+use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR, VARIANT};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -72,17 +73,23 @@ use windows::Win32::System::Diagnostics::Debug::Beep;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, GetCurrentProcess, SetWaitableTimer, WaitForSingleObject,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    CreateWaitableTimerExW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW,
+    SetWaitableTimer, WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::SHCreateMemStream;
-use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, PostMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetDesktopWindow, GetForegroundWindow, GetWindowThreadProcessId, PostMessageW,
+};
 
 use crate::audio::{
     default_audio_endpoint_id, enumerate_audio_input_devices, AudioEndpointMonitor,
     AudioInputDevice, WasapiStream,
 };
-use crate::config::{BufferStorageMode, ReplayConfig, VideoCodecType};
+use crate::config::{
+    clean_exe_stem_name, format_clip_relative_path, lookup_custom_game_name,
+    sanitize_path_component, BufferStorageMode, ReplayConfig, VideoCodecType,
+};
 use crate::voice::VoiceRecognizer;
 
 pub const WM_APP_STATUS: u32 = 0x8000 + 101;
@@ -521,6 +528,7 @@ pub struct ReplayEngine {
     pub video_pipeline_status: Mutex<String>,
     pub status_message: Mutex<String>,
     pub last_saved_file: Mutex<String>,
+    pub last_foreground_game: Mutex<String>,
 
     segments: Mutex<Vec<ReplaySegment>>,
     is_running: AtomicBool,
@@ -539,6 +547,9 @@ impl ReplayEngine {
     pub fn new(config: ReplayConfig) -> Arc<Self> {
         let voice = VoiceRecognizer::new(&config.voice_phrase);
         let caps = probe_hardware_codec_caps();
+        let initial_game = detect_foreground_exe_path()
+            .map(|p| resolve_game_name_for_exe_path(&p, &config.game_name_map))
+            .unwrap_or_else(|| "Desktop".to_string());
         let engine = Arc::new(Self {
             config: Mutex::new(config),
             voice,
@@ -552,6 +563,7 @@ impl ReplayEngine {
             video_pipeline_status: Mutex::new("Standby".to_string()),
             status_message: Mutex::new("Siap digunakan.".to_string()),
             last_saved_file: Mutex::new(String::new()),
+            last_foreground_game: Mutex::new(initial_game),
             segments: Mutex::new(Vec::new()),
             is_running: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
@@ -566,6 +578,29 @@ impl ReplayEngine {
         engine.refresh_displays_and_gpu();
         engine.refresh_audio_inputs();
         engine
+    }
+
+    pub fn refresh_foreground_game(&self, custom_map: &str) -> String {
+        if let Some(exe_path) = detect_foreground_exe_path() {
+            let name = resolve_game_name_for_exe_path(&exe_path, custom_map);
+            if !name.is_empty() {
+                if let Ok(mut guard) = self.last_foreground_game.lock() {
+                    *guard = name.clone();
+                }
+                return name;
+            }
+        }
+        self.last_foreground_game
+            .lock()
+            .ok()
+            .map(|g| {
+                if g.trim().is_empty() {
+                    "Desktop".to_string()
+                } else {
+                    g.clone()
+                }
+            })
+            .unwrap_or_else(|| "Desktop".to_string())
     }
 
     pub fn set_ui_hwnd(&self, hwnd: HWND) {
@@ -903,12 +938,14 @@ impl ReplayEngine {
             let out_dir = Path::new(&cfg.output_folder);
             let _ = fs::create_dir_all(out_dir);
 
-            let output_path = unique_replay_output_path(out_dir);
-            let file_name = output_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Replay.mp4")
-                .to_string();
+            let game_name = engine.refresh_foreground_game(&cfg.game_name_map);
+            let output_path =
+                unique_replay_output_path(out_dir, &cfg.clip_name_template, &game_name);
+            let display_name = output_path
+                .strip_prefix(out_dir)
+                .unwrap_or(&output_path)
+                .to_string_lossy()
+                .replace('\\', "/");
 
             let t0 = Instant::now();
             let ok = merge_segments_pure_native(&snapshot, &output_path, cfg.fps);
@@ -928,7 +965,7 @@ impl ReplayEngine {
                         let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
                         engine.raise_status(format!(
                             "Tersimpan: {} ({:.2} MB, {} ms)",
-                            file_name, size_mb, elapsed_ms
+                            display_name, size_mb, elapsed_ms
                         ));
                         engine.notify_saved(output_path.to_string_lossy().into_owned());
                         engine.is_saving.store(false, Ordering::Release);
@@ -1998,6 +2035,7 @@ impl ReplayEngine {
                     engine.current_fps_x10.store(cur, Ordering::Relaxed);
                     fps_counter = 0;
                     fps_timer = Instant::now();
+                    let _ = engine.refresh_foreground_game(&cfg_init.game_name_map);
                 }
 
                 // 4. Segment Rotation + Self-Healing Error Detection
@@ -3068,20 +3106,209 @@ pub fn inspect_mp4_video_info(path: &Path) -> Option<(String, u32, u32, u32, u32
     }
 }
 
-fn unique_replay_output_path(out_dir: &Path) -> PathBuf {
-    let base = unsafe {
+#[link(name = "version")]
+extern "system" {
+    fn GetFileVersionInfoSizeW(lptstrfilename: PCWSTR, lpdwhandle: *mut u32) -> u32;
+    fn GetFileVersionInfoW(
+        lptstrfilename: PCWSTR,
+        dwhandle: u32,
+        dwlen: u32,
+        lpdata: *mut std::ffi::c_void,
+    ) -> BOOL;
+    fn VerQueryValueW(
+        pblock: *const std::ffi::c_void,
+        lpsubblock: PCWSTR,
+        lplpbuffer: *mut *mut std::ffi::c_void,
+        pulen: *mut u32,
+    ) -> BOOL;
+}
+
+fn is_usable_product_name(name: &str) -> bool {
+    let trimmed = name
+        .trim()
+        .trim_matches(|c: char| c == '®' || c == '™' || c.is_whitespace());
+    if trimmed.len() < 2 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "microsoft® windows® operating system"
+            | "microsoft windows operating system"
+            | "windows operating system"
+            | "bootstrappackagedgame"
+            | "unrealgame"
+            | "application"
+    )
+}
+
+/// Queries the PE version resource (`GetFileVersionInfoW` / `VerQueryValueW`) of `exe_path`
+/// for `ProductName` (or `FileDescription` fallback), ignoring generic OS/engine placeholders.
+pub fn query_exe_version_product_name(exe_path: &Path) -> Option<String> {
+    unsafe {
+        let wide_path: Vec<u16> = exe_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut handle: u32 = 0;
+        let size = GetFileVersionInfoSizeW(PCWSTR(wide_path.as_ptr()), &mut handle);
+        if size == 0 || size > 4 * 1024 * 1024 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size as usize];
+        if !GetFileVersionInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            0,
+            size,
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+
+        let mut candidates: Vec<(u16, u16)> = Vec::new();
+        let trans_sub: Vec<u16> = "\\VarFileInfo\\Translation\0".encode_utf16().collect();
+        let mut trans_ptr: *mut std::ffi::c_void = null_mut();
+        let mut trans_len: u32 = 0;
+        if VerQueryValueW(
+            buffer.as_ptr() as *const std::ffi::c_void,
+            PCWSTR(trans_sub.as_ptr()),
+            &mut trans_ptr,
+            &mut trans_len,
+        )
+        .as_bool()
+            && !trans_ptr.is_null()
+            && trans_len >= 4
+        {
+            let count = (trans_len as usize) / 4;
+            let pairs = std::slice::from_raw_parts(trans_ptr as *const [u16; 2], count);
+            for pair in pairs {
+                candidates.push((pair[0], pair[1]));
+            }
+        }
+
+        for fallback in [
+            (0x0409, 0x04B0),
+            (0x0409, 0x04E4),
+            (0x0000, 0x04B0),
+            (0x0409, 0x0000),
+        ] {
+            if !candidates.contains(&fallback) {
+                candidates.push(fallback);
+            }
+        }
+
+        for field in ["ProductName", "FileDescription"] {
+            for &(lang, cp) in &candidates {
+                let query = format!("\\StringFileInfo\\{:04x}{:04x}\\{}\0", lang, cp, field);
+                let query_w: Vec<u16> = query.encode_utf16().collect();
+                let mut val_ptr: *mut std::ffi::c_void = null_mut();
+                let mut val_len: u32 = 0;
+                if VerQueryValueW(
+                    buffer.as_ptr() as *const std::ffi::c_void,
+                    PCWSTR(query_w.as_ptr()),
+                    &mut val_ptr,
+                    &mut val_len,
+                )
+                .as_bool()
+                    && !val_ptr.is_null()
+                    && val_len > 0
+                {
+                    let slice =
+                        std::slice::from_raw_parts(val_ptr as *const u16, val_len as usize);
+                    let s = utf16_slice_to_string(slice);
+                    if is_usable_product_name(&s) {
+                        let clean = sanitize_path_component(&s, "");
+                        if !clean.is_empty() {
+                            return Some(clean);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Resolves a friendly folder/clip name for `exe_path`:
+/// 1. Custom game name map (`msedge.exe -> Browser`, etc.)
+/// 2. PE `GetFileVersionInfoW` `ProductName` / `FileDescription`
+/// 3. Cleaned executable stem fallback
+pub fn resolve_game_name_for_exe_path(exe_path: &Path, custom_map: &str) -> String {
+    let path_str = exe_path.to_string_lossy();
+    if let Some(mapped) = lookup_custom_game_name(custom_map, &path_str) {
+        return mapped;
+    }
+    if let Some(prod) = query_exe_version_product_name(exe_path) {
+        return prod;
+    }
+    clean_exe_stem_name(&path_str)
+}
+
+/// Queries the foreground window's executable path via
+/// `GetForegroundWindow` -> `GetWindowThreadProcessId` -> `QueryFullProcessImageNameW`.
+/// Returns `None` if the foreground window belongs to the current `NVLiteReplay` process.
+pub fn detect_foreground_exe_path() -> Option<PathBuf> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return None;
+        }
+        let hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            hproc,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(hproc);
+        if !ok || len == 0 {
+            return None;
+        }
+        let path_str = String::from_utf16_lossy(&buf[..len as usize]);
+        if path_str.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
+        }
+    }
+}
+
+pub fn unique_replay_output_path(out_dir: &Path, template: &str, game_name: &str) -> PathBuf {
+    let (date_str, time_str) = unsafe {
         let st = GetLocalTime();
-        format!(
-            "Replay_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        (
+            format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+            format!("{:02}-{:02}-{:02}", st.wHour, st.wMinute, st.wSecond),
         )
     };
-    let first = out_dir.join(format!("{}.mp4", base));
+    let rel = format_clip_relative_path(template, game_name, &date_str, &time_str);
+    let base_path = out_dir.join(&rel);
+    if let Some(parent) = base_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let stem = base_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Replay");
+    let parent_dir = base_path.parent().unwrap_or(out_dir);
+
+    let first = parent_dir.join(format!("{}.mp4", stem));
     if !first.exists() {
         return first;
     }
     for n in 2..=999u32 {
-        let cand = out_dir.join(format!("{}_{}.mp4", base, n));
+        let cand = parent_dir.join(format!("{}_{}.mp4", stem, n));
         if !cand.exists() {
             return cand;
         }
@@ -3792,5 +4019,61 @@ mod tests {
             seg.ram_data.as_ref().unwrap(),
             snapshot[0].ram_data.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn foreground_game_name_resolution_and_template_output_path() {
+        use crate::config::DEFAULT_GAME_NAME_MAP;
+
+        // 1. Custom map wins (e.g. msedge.exe -> Browser, explorer.exe -> Desktop)
+        assert_eq!(
+            resolve_game_name_for_exe_path(
+                Path::new(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+                DEFAULT_GAME_NAME_MAP
+            ),
+            "Browser"
+        );
+        assert_eq!(
+            resolve_game_name_for_exe_path(
+                Path::new(r"C:\Windows\explorer.exe"),
+                DEFAULT_GAME_NAME_MAP
+            ),
+            "Desktop"
+        );
+
+        // 2. GetFileVersionInfoW reads real Windows PE version info (FileDescription fallback when
+        // ProductName is generic "Microsoft® Windows® Operating System")
+        let cmd_path = Path::new(r"C:\Windows\System32\cmd.exe");
+        if cmd_path.exists() {
+            let info = query_exe_version_product_name(cmd_path);
+            assert!(
+                info.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+                "Expected FileDescription/ProductName from cmd.exe via GetFileVersionInfoW, got {:?}",
+                info
+            );
+        }
+
+        // 3. unique_replay_output_path creates game subfolder & handles collision
+        let tmp = std::env::temp_dir().join(format!("nvlite_tpl_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let p1 = unique_replay_output_path(&tmp, "{game}/Replay_{date}_{time}", "Valorant");
+        assert_eq!(p1.parent().unwrap(), tmp.join("Valorant"));
+        assert!(p1.parent().unwrap().is_dir());
+        let name1 = p1.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name1.starts_with("Replay_") && name1.ends_with(".mp4"));
+
+        // Touch p1 so the second call picks _2.mp4
+        fs::write(&p1, b"test").unwrap();
+        let p2 = unique_replay_output_path(&tmp, "{game}/Replay_{date}_{time}", "Valorant");
+        assert_ne!(p1, p2);
+        assert!(p2
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_2.mp4"));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

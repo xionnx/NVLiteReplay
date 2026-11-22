@@ -252,6 +252,12 @@ const COOLDOWN_OPTIONS: &[(u32, &str)] = &[
     (15, "15 dtk"),
 ];
 
+const CLIP_TEMPLATE_OPTIONS: &[(&str, &str)] = &[
+    ("{game}/Replay_{date}_{time}", "{game}/Replay_{date}_{time}"),
+    ("{game}/{game}_{date}_{time}", "{game}/{game}_{date}_{time}"),
+    ("Replay_{date}_{time}", "Replay_{date}_{time} (Tanpa Folder)"),
+];
+
 // Fixed layout geometry (DIPs) — Minimalist Monochrome Grid
 const R_TAB_0: RectF = RectF::new(148.0, 10.0, 56.0, 26.0);
 const R_TAB_1: RectF = RectF::new(208.0, 10.0, 56.0, 26.0);
@@ -287,7 +293,7 @@ fn hk_slot_rect(idx: usize) -> RectF {
         1 => 237.0,
         _ => 454.0,
     };
-    RectF::new(x, 232.0, 206.0, 56.0)
+    RectF::new(x, 226.0, 206.0, 52.0)
 }
 
 fn hk_clear_rect(idx: usize) -> RectF {
@@ -295,16 +301,27 @@ fn hk_clear_rect(idx: usize) -> RectF {
     RectF::new(r.r - 24.0, r.t + 6.0, 18.0, 18.0)
 }
 
-const R_HK_PRESET_0: RectF = RectF::new(112.0, 297.0, 146.0, 26.0);
-const R_HK_PRESET_1: RectF = RectF::new(264.0, 297.0, 94.0, 26.0);
-const R_HK_PRESET_2: RectF = RectF::new(364.0, 297.0, 112.0, 26.0);
-const R_BTN_BROWSE: RectF = RectF::new(544.0, 370.0, 116.0, 32.0);
-const R_BTN_TEMP_BROWSE: RectF = RectF::new(466.0, 434.0, 116.0, 32.0);
-const R_BTN_TEMP_RESET: RectF = RectF::new(588.0, 434.0, 72.0, 32.0);
-const R_TOG_TRAY: RectF = RectF::new(618.0, 506.0, 42.0, 22.0);
-const R_TOG_BEEP: RectF = RectF::new(618.0, 540.0, 42.0, 22.0);
-const R_TOG_FOCUS: RectF = RectF::new(618.0, 574.0, 42.0, 22.0);
-const R_TOG_AUTO_UPDATE: RectF = RectF::new(618.0, 608.0, 42.0, 22.0);
+const R_HK_PRESET_0: RectF = RectF::new(112.0, 285.0, 146.0, 24.0);
+const R_HK_PRESET_1: RectF = RectF::new(264.0, 285.0, 94.0, 24.0);
+const R_HK_PRESET_2: RectF = RectF::new(364.0, 285.0, 112.0, 24.0);
+const R_BTN_BROWSE: RectF = RectF::new(544.0, 344.0, 116.0, 30.0);
+const R_TPL_0: RectF = RectF::new(20.0, 400.0, 210.0, 26.0);
+const R_TPL_1: RectF = RectF::new(236.0, 400.0, 210.0, 26.0);
+const R_TPL_2: RectF = RectF::new(452.0, 400.0, 208.0, 26.0);
+const R_BTN_TEMP_BROWSE: RectF = RectF::new(466.0, 452.0, 116.0, 30.0);
+const R_BTN_TEMP_RESET: RectF = RectF::new(588.0, 452.0, 72.0, 30.0);
+const R_TOG_TRAY: RectF = RectF::new(618.0, 520.0, 42.0, 22.0);
+const R_TOG_BEEP: RectF = RectF::new(618.0, 551.0, 42.0, 22.0);
+const R_TOG_FOCUS: RectF = RectF::new(618.0, 582.0, 42.0, 22.0);
+const R_TOG_AUTO_UPDATE: RectF = RectF::new(618.0, 613.0, 42.0, 22.0);
+
+fn clip_tpl_rect(idx: usize) -> RectF {
+    match idx {
+        0 => R_TPL_0,
+        1 => R_TPL_1,
+        _ => R_TPL_2,
+    }
+}
 
 // Global Footer GitHub Update Bar (y=646..700)
 const R_BTN_GITHUB_PAGE: RectF = RectF::new(426.0, 658.0, 94.0, 30.0);
@@ -1704,7 +1721,25 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
             state.dragging_slider,
             drop_open,
         ),
-        2 => paint_tab_system(rt, brush, d2d, &cfg, state.capturing_hotkey, running, hx, hy),
+        2 => {
+            let fg_game = state
+                .engine
+                .last_foreground_game
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|_| "Desktop".to_string());
+            paint_tab_system(
+                rt,
+                brush,
+                d2d,
+                &cfg,
+                &fg_game,
+                state.capturing_hotkey,
+                running,
+                hx,
+                hy,
+            )
+        }
         _ => paint_tab_voice(
             rt,
             brush,
@@ -2162,12 +2197,13 @@ unsafe fn paint_tab_system(
     brush: &ID2D1SolidColorBrush,
     d2d: &D2DResources,
     cfg: &crate::config::ReplayConfig,
+    fg_game: &str,
     capturing: Option<HotkeySlot>,
     running: bool,
     hx: f32,
     hy: f32,
 ) {
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 212.0, 340.0, 16.0), "GLOBAL SHORTCUT — KLIK SLOT UNTUK REKAM", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 208.0, 340.0, 16.0), "GLOBAL SHORTCUT — KLIK SLOT UNTUK REKAM", COL_TEXT_MUTED);
     let (mode_txt, mode_col) = if capturing.is_some() {
         ("Tekan kombinasi tombol (Esc batal)", COL_AMBER)
     } else if cfg.matching_hotkey_preset().is_none() {
@@ -2175,7 +2211,7 @@ unsafe fn paint_tab_system(
     } else {
         ("Preset Standar", COL_TEXT_MUTED)
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(380.0, 212.0, 280.0, 16.0), mode_txt, mode_col);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(380.0, 208.0, 280.0, 16.0), mode_txt, mode_col);
 
     let live_mods = if capturing.is_some() {
         current_async_hotkey_mods()
@@ -2204,7 +2240,7 @@ unsafe fn paint_tab_system(
             rt,
             brush,
             &d2d.fmt_small,
-            RectF::new(r.l + 12.0, r.t + 8.0, 158.0, 16.0),
+            RectF::new(r.l + 12.0, r.t + 6.0, 158.0, 16.0),
             slot.title(),
             if is_cap { COL_AMBER } else { COL_TEXT_MUTED },
         );
@@ -2223,7 +2259,7 @@ unsafe fn paint_tab_system(
             );
         }
 
-        let val_r = RectF::new(r.l + 12.0, r.t + 28.0, r.r - r.l - 24.0, 22.0);
+        let val_r = RectF::new(r.l + 12.0, r.t + 25.0, r.r - r.l - 24.0, 22.0);
         let (val_str, val_col) = if is_cap {
             (format_modifier_preview(live_mods), COL_AMBER)
         } else if binding.is_enabled() {
@@ -2243,7 +2279,7 @@ unsafe fn paint_tab_system(
         draw_text(rt, brush, &d2d.fmt_bold, val_r, &val_str, val_col);
     }
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 301.0, 86.0, 18.0), "Preset Cepat:", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 288.0, 86.0, 18.0), "Preset Cepat:", COL_TEXT_MUTED);
     let active_preset = cfg.matching_hotkey_preset();
     let presets = [
         (R_HK_PRESET_0, HotkeyPresetType::CtrlShiftF9F10, "Ctrl+Shift+F9/F10/M"),
@@ -2263,23 +2299,70 @@ unsafe fn paint_tab_system(
             if active { COL_TEXT } else { COL_TEXT_SUB },
         );
     }
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(484.0, 301.0, 176.0, 18.0), "Ctrl / Shift / Alt / Win", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(484.0, 288.0, 176.0, 18.0), "Ctrl / Shift / Alt / Win", COL_TEXT_MUTED);
 
-    draw_hline(rt, brush, 20.0, 660.0, 336.0, COL_DIVIDER);
+    draw_hline(rt, brush, 20.0, 660.0, 317.0, COL_DIVIDER);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 350.0, 300.0, 16.0), "FOLDER PENYIMPANAN VIDEO MP4", COL_TEXT_MUTED);
-    let path_box = RectF::new(20.0, 370.0, 516.0, 32.0);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 326.0, 300.0, 16.0), "FOLDER PENYIMPANAN VIDEO MP4", COL_TEXT_MUTED);
+    let path_box = RectF::new(20.0, 344.0, 516.0, 30.0);
     draw_card(rt, brush, path_box, 6.0, COL_SURFACE, COL_BORDER);
     let out_disp = compact_path_label(&cfg.output_folder, 66);
-    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 370.0, 492.0, 32.0), &out_disp, COL_TEXT_SUB);
+    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 344.0, 492.0, 30.0), &out_disp, COL_TEXT_SUB);
 
     let br_hov = R_BTN_BROWSE.contains(hx, hy);
     draw_button(rt, brush, R_BTN_BROWSE, 6.0, BtnStyle::Secondary, br_hov, false);
     draw_text(rt, brush, &d2d.fmt_center_bold, R_BTN_BROWSE, "Pilih Folder", COL_TEXT);
 
+    // Template Nama Klip & Folder sesuai aplikasi/game di depan ({game}, {date}, {time})
+    draw_text(
+        rt,
+        brush,
+        &d2d.fmt_small,
+        RectF::new(20.0, 381.0, 290.0, 16.0),
+        "FORMAT NAMA KLIP & FOLDER ({game} {date} {time})",
+        COL_TEXT_MUTED,
+    );
+    let sample_game = if fg_game.trim().is_empty() || fg_game == "Desktop" {
+        "Valorant"
+    } else {
+        fg_game.trim()
+    };
+    let preview_rel = crate::config::format_clip_relative_path(
+        &cfg.clip_name_template,
+        sample_game,
+        "2026-11-21",
+        "14-05-00",
+    )
+    .to_string_lossy()
+    .replace('\\', "/");
+    let preview_txt = format!("Contoh: {}.mp4", truncate_tail(&preview_rel, 38));
+    draw_text(
+        rt,
+        brush,
+        &d2d.fmt_right_small,
+        RectF::new(312.0, 381.0, 348.0, 16.0),
+        &preview_txt,
+        COL_EMERALD,
+    );
+
+    for (idx, &(tpl_val, tpl_label)) in CLIP_TEMPLATE_OPTIONS.iter().enumerate() {
+        let tr = clip_tpl_rect(idx);
+        let active = cfg.clip_name_template.trim().eq_ignore_ascii_case(tpl_val);
+        let hov = tr.contains(hx, hy);
+        draw_chip(rt, brush, tr, 6.0, active, hov, false);
+        draw_text(
+            rt,
+            brush,
+            if active { &d2d.fmt_center_bold } else { &d2d.fmt_center_small },
+            tr,
+            tpl_label,
+            if active { COL_TEXT } else { COL_TEXT_SUB },
+        );
+    }
+
     let default_temp = crate::config::ReplayConfig::default_temp_folder();
     let is_custom_temp = cfg.temp_folder.trim() != default_temp;
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 414.0, 360.0, 16.0), "FOLDER TEMP BUFFER (MODE DISK)", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 434.0, 360.0, 16.0), "FOLDER TEMP BUFFER (MODE DISK)", COL_TEXT_MUTED);
     let (temp_hint, temp_hint_col) = if running {
         ("Terkunci saat Replay aktif", COL_AMBER)
     } else if is_custom_temp {
@@ -2287,9 +2370,9 @@ unsafe fn paint_tab_system(
     } else {
         ("Default Windows %TEMP%", COL_TEXT_MUTED)
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 414.0, 260.0, 16.0), temp_hint, temp_hint_col);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 434.0, 260.0, 16.0), temp_hint, temp_hint_col);
 
-    let temp_box = RectF::new(20.0, 434.0, 438.0, 32.0);
+    let temp_box = RectF::new(20.0, 452.0, 438.0, 30.0);
     draw_card(
         rt,
         brush,
@@ -2303,7 +2386,7 @@ unsafe fn paint_tab_system(
         rt,
         brush,
         &d2d.fmt_reg,
-        RectF::new(32.0, 434.0, 414.0, 32.0),
+        RectF::new(32.0, 452.0, 414.0, 30.0),
         &temp_disp,
         if running { COL_TEXT_DIM } else { COL_TEXT_SUB },
     );
@@ -2331,20 +2414,20 @@ unsafe fn paint_tab_system(
         if trst_active { COL_TEXT_SUB } else { COL_TEXT_DIM },
     );
 
-    draw_hline(rt, brush, 20.0, 660.0, 476.0, COL_DIVIDER);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 484.0, 300.0, 16.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
+    draw_hline(rt, brush, 20.0, 660.0, 491.0, COL_DIVIDER);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 498.0, 300.0, 16.0), "PERILAKU APLIKASI", COL_TEXT_MUTED);
 
     let rows = [
-        (R_TOG_TRAY, 502.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
-        (R_TOG_BEEP, 536.0, "Bunyi Beep konfirmasi saat klip replay tersimpan", cfg.play_sound_on_save),
-        (R_TOG_FOCUS, 570.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
-        (R_TOG_AUTO_UPDATE, 604.0, "Periksa pembaruan GitHub Releases otomatis saat dibuka", cfg.auto_check_updates),
+        (R_TOG_TRAY, 516.0, "Minimize ke System Tray saat jendela ditutup (X)", cfg.minimize_to_tray_on_close),
+        (R_TOG_BEEP, 547.0, "Bunyi Beep konfirmasi saat klip replay tersimpan", cfg.play_sound_on_save),
+        (R_TOG_FOCUS, 578.0, "Mode Fokus Game — Tahan notifikasi popup saat Fullscreen", cfg.suppress_notifications_in_game),
+        (R_TOG_AUTO_UPDATE, 609.0, "Periksa pembaruan GitHub Releases otomatis saat dibuka", cfg.auto_check_updates),
     ];
     for (idx, (tog_r, y, title, val)) in rows.into_iter().enumerate() {
-        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 30.0), title, COL_TEXT_SUB);
+        draw_text(rt, brush, &d2d.fmt_reg, RectF::new(20.0, y, 580.0, 28.0), title, COL_TEXT_SUB);
         draw_toggle_switch(rt, brush, tog_r, val, tog_r.contains(hx, hy), false, COL_EMERALD);
         if idx < 3 {
-            draw_hline(rt, brush, 20.0, 660.0, y + 32.0, c_rgb(24, 24, 29));
+            draw_hline(rt, brush, 20.0, 660.0, y + 29.0, c_rgb(24, 24, 29));
         }
     }
 }
@@ -2990,6 +3073,7 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
                 || R_HK_PRESET_0.contains(x, y)
                 || R_HK_PRESET_1.contains(x, y)
                 || R_HK_PRESET_2.contains(x, y)
+                || (0..CLIP_TEMPLATE_OPTIONS.len()).any(|i| clip_tpl_rect(i).contains(x, y))
                 || R_BTN_BROWSE.contains(x, y)
                 || (!running && R_BTN_TEMP_BROWSE.contains(x, y))
                 || (!running && is_custom_temp && R_BTN_TEMP_RESET.contains(x, y))
@@ -3321,6 +3405,15 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
             }
 
             cancel_hotkey_capture(state);
+            for (idx, &(tpl_val, _)) in CLIP_TEMPLATE_OPTIONS.iter().enumerate() {
+                if clip_tpl_rect(idx).contains(x, y) {
+                    let mut cfg = state.engine.config.lock().unwrap();
+                    cfg.clip_name_template = tpl_val.to_string();
+                    cfg.save();
+                    let _ = InvalidateRect(state.hwnd, None, false);
+                    return;
+                }
+            }
             if R_BTN_BROWSE.contains(x, y) {
                 if let Some(chosen) = pick_folder(state.hwnd, "Pilih Folder Penyimpanan Replay") {
                     let mut cfg = state.engine.config.lock().unwrap();
@@ -3807,8 +3900,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let st = &*ptr;
                 let file = st.engine.last_saved_file.lock().unwrap().clone();
                 if !file.is_empty() {
-                    let name = Path::new(&file).file_name().and_then(|s| s.to_str()).unwrap_or("Replay.mp4");
-                    show_tray_balloon(st, "Instant Replay Tersimpan!", &format!("File: {}", name));
+                    let out_dir = st.engine.config.lock().unwrap().output_folder.clone();
+                    let rel_name = Path::new(&file)
+                        .strip_prefix(&out_dir)
+                        .unwrap_or_else(|_| Path::new(&file))
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    show_tray_balloon(st, "Instant Replay Tersimpan!", &format!("File: {}", rel_name));
                 }
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -3834,6 +3932,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 st.caret_tick = st.caret_tick.wrapping_add(1);
                 if !st.fast_timer_active || (st.caret_tick % 4 == 0) {
                     st.last_process_ram_mb = query_process_ram_mb();
+                    let game_map = st.engine.config.lock().unwrap().game_name_map.clone();
+                    let _ = st.engine.refresh_foreground_game(&game_map);
                 }
                 sync_timer_rate(st);
                 let _ = InvalidateRect(hwnd, None, false);
