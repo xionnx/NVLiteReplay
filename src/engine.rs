@@ -279,6 +279,56 @@ impl Drop for HighResWaitableTimer {
     }
 }
 
+#[link(name = "avrt")]
+extern "system" {
+    fn AvSetMmThreadCharacteristicsW(taskname: PCWSTR, taskindex: *mut u32) -> HANDLE;
+    fn AvSetMmThreadPriority(avrt_handle: HANDLE, priority: i32) -> BOOL;
+    fn AvRevertMmThreadCharacteristics(avrt_handle: HANDLE) -> BOOL;
+}
+
+/// RAII Multimedia Class Scheduler Service (MMCSS) thread priority guard (`avrt.dll`).
+/// Elevates real-time video capture & WASAPI audio threads via `AvSetMmThreadCharacteristicsW`
+/// (`"Capture"` / `"Audio"`) so heavy CPU games cannot starve frame pacing or audio draining.
+pub struct MmcssThreadGuard {
+    handle: HANDLE,
+}
+
+impl MmcssThreadGuard {
+    pub fn new(task_name: &str) -> Self {
+        unsafe {
+            let wide: Vec<u16> = task_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut task_index: u32 = 0;
+            let mut handle = AvSetMmThreadCharacteristicsW(PCWSTR(wide.as_ptr()), &mut task_index);
+            if handle.is_invalid() && !task_name.eq_ignore_ascii_case("Audio") {
+                let fallback: Vec<u16> = "Audio\0".encode_utf16().collect();
+                task_index = 0;
+                handle = AvSetMmThreadCharacteristicsW(PCWSTR(fallback.as_ptr()), &mut task_index);
+            }
+            if !handle.is_invalid() {
+                // AVRT_PRIORITY_HIGH (1): elevates capture & audio thread above normal game worker threads
+                let _ = AvSetMmThreadPriority(handle, 1);
+            }
+            Self { handle }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool {
+        !self.handle.is_invalid()
+    }
+}
+
+impl Drop for MmcssThreadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_invalid() {
+                let _ = AvRevertMmThreadCharacteristics(self.handle);
+                self.handle = HANDLE::default();
+            }
+        }
+    }
+}
+
 struct ActiveSegmentWriter {
     seq_id: u64,
     sink_writer: IMFSinkWriter,
@@ -1152,6 +1202,7 @@ impl ReplayEngine {
         }
 
         let _com_mf_guard = unsafe { ComMfGuard::new() };
+        let _mmcss_guard = MmcssThreadGuard::new("Capture");
         let _exit_guard = CaptureExitGuard {
             engine: Arc::clone(&engine),
         };
@@ -1544,6 +1595,8 @@ impl ReplayEngine {
             let mut need_size_check = true;
             let mut need_ring_clear = false;
             let mut last_dupl_retry = Instant::now();
+            let mut last_valid_ring_slot: Option<usize> = None;
+            let mut render_seq: usize = 0;
 
             let frame_dur_hns: i64 = 10_000_000 / fps as i64;
             let frame_interval_ms: f64 = 1000.0 / fps as f64;
@@ -1628,6 +1681,8 @@ impl ReplayEngine {
 
                 // 1. Capture desktop frame
                 let mut captured_via_dupl = false;
+                let mut dupl_screen_updated = false;
+                let mut dupl_mouse_updated = false;
                 if desk_dupl.is_none() && dupl_supported {
                     captured_via_dupl = true;
                     if last_dupl_retry.elapsed() >= Duration::from_millis(250) {
@@ -1639,6 +1694,7 @@ impl ReplayEngine {
                         );
                         if desk_dupl.is_some() {
                             need_size_check = true;
+                            last_valid_ring_slot = None;
                             if let Some(ref mut comp) = cursor_comp {
                                 comp.on_duplication_reset();
                             }
@@ -1653,6 +1709,7 @@ impl ReplayEngine {
                     match acq_res {
                         Ok(()) => {
                             if frame_info.LastMouseUpdateTime != 0 {
+                                dupl_mouse_updated = true;
                                 if let Some(ref mut comp) = cursor_comp {
                                     comp.update_from_dxgi(dupl, &frame_info, &device, &context);
                                 }
@@ -1686,12 +1743,15 @@ impl ReplayEngine {
                                         }
                                         if let Some(ref stex) = staging_tex {
                                             context.CopyResource(stex, &dupl_tex);
+                                            dupl_screen_updated = true;
                                         }
                                     }
                                 }
                             }
                             let _ = dupl.ReleaseFrame();
-                            context.Flush();
+                            if dupl_screen_updated || dupl_mouse_updated {
+                                context.Flush();
+                            }
                             captured_via_dupl = true;
                         }
                         Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -1707,6 +1767,7 @@ impl ReplayEngine {
                             );
                             if desk_dupl.is_some() {
                                 need_size_check = true;
+                                last_valid_ring_slot = None;
                                 if let Some(ref mut comp) = cursor_comp {
                                     comp.on_duplication_reset();
                                 }
@@ -1717,132 +1778,149 @@ impl ReplayEngine {
                     }
                 }
 
-                let ring_slot = (aw_frames as usize) & (RING_SLOTS - 1);
-                let (dst_bgra_tex, dst_bgra_rtv) = if use_nv12 {
-                    (
-                        comp_bgra_tex.as_ref().unwrap(),
-                        comp_bgra_rtv.as_ref().unwrap(),
-                    )
-                } else {
-                    (&gpu_tex_ring[ring_slot], &gpu_rtv_ring[ring_slot])
-                };
+                // Reuse the previous NV12/BGRA ring slot when neither desktop pixels nor cursor
+                // changed (`LastPresentTime == 0 && LastMouseUpdateTime == 0`).
+                // Encoder still receives a sample every tick (preserving CFR), while GPU skips
+                // CopyResource, cursor composite shader, and VideoProcessorBlt BGRA -> NV12.
+                let need_render_and_convert = !captured_via_dupl
+                    || last_valid_ring_slot.is_none()
+                    || need_ring_clear
+                    || dupl_screen_updated
+                    || dupl_mouse_updated;
 
-                if captured_via_dupl {
-                    if need_ring_clear {
-                        need_ring_clear = false;
-                        let clear_black = [0.0f32, 0.0, 0.0, 1.0];
-                        if use_nv12 {
-                            context.ClearRenderTargetView(dst_bgra_rtv, &clear_black);
-                        } else {
-                            for rtv in &gpu_rtv_ring {
-                                context.ClearRenderTargetView(rtv, &clear_black);
+                let ring_slot = if need_render_and_convert {
+                    let slot = render_seq & (RING_SLOTS - 1);
+                    render_seq = render_seq.wrapping_add(1);
+                    let (dst_bgra_tex, dst_bgra_rtv) = if use_nv12 {
+                        (
+                            comp_bgra_tex.as_ref().unwrap(),
+                            comp_bgra_rtv.as_ref().unwrap(),
+                        )
+                    } else {
+                        (&gpu_tex_ring[slot], &gpu_rtv_ring[slot])
+                    };
+
+                    if captured_via_dupl {
+                        if need_ring_clear {
+                            need_ring_clear = false;
+                            let clear_black = [0.0f32, 0.0, 0.0, 1.0];
+                            if use_nv12 {
+                                context.ClearRenderTargetView(dst_bgra_rtv, &clear_black);
+                            } else {
+                                for rtv in &gpu_rtv_ring {
+                                    context.ClearRenderTargetView(rtv, &clear_black);
+                                }
                             }
                         }
-                    }
 
-                    let mut cursor_off_x = 0i32;
-                    let mut cursor_off_y = 0i32;
-                    let mut copied_frame = false;
-                    if let Some(ref stex) = staging_tex {
-                        copied_frame = true;
-                        if staging_w == cap_width && staging_h == cap_height {
-                            context.CopyResource(dst_bgra_tex, stex);
-                        } else {
-                            let copy_w = staging_w.min(cap_width);
-                            let copy_h = staging_h.min(cap_height);
-                            let src_x = if staging_w > cap_width {
-                                (staging_w - cap_width) / 2
+                        let mut cursor_off_x = 0i32;
+                        let mut cursor_off_y = 0i32;
+                        let mut copied_frame = false;
+                        if let Some(ref stex) = staging_tex {
+                            copied_frame = true;
+                            if staging_w == cap_width && staging_h == cap_height {
+                                context.CopyResource(dst_bgra_tex, stex);
                             } else {
-                                0
-                            };
-                            let src_y = if staging_h > cap_height {
-                                (staging_h - cap_height) / 2
-                            } else {
-                                0
-                            };
-                            let dst_x = if cap_width > staging_w {
-                                (cap_width - staging_w) / 2
-                            } else {
-                                0
-                            };
-                            let dst_y = if cap_height > staging_h {
-                                (cap_height - staging_h) / 2
-                            } else {
-                                0
-                            };
-                            cursor_off_x = dst_x as i32 - src_x as i32;
-                            cursor_off_y = dst_y as i32 - src_y as i32;
-                            let src_box = D3D11_BOX {
-                                left: src_x,
-                                top: src_y,
-                                front: 0,
-                                right: src_x + copy_w,
-                                bottom: src_y + copy_h,
-                                back: 1,
-                            };
-                            context.CopySubresourceRegion(
-                                dst_bgra_tex,
-                                0,
-                                dst_x,
-                                dst_y,
-                                0,
-                                stex,
-                                0,
-                                Some(&src_box),
-                            );
+                                let copy_w = staging_w.min(cap_width);
+                                let copy_h = staging_h.min(cap_height);
+                                let src_x = if staging_w > cap_width {
+                                    (staging_w - cap_width) / 2
+                                } else {
+                                    0
+                                };
+                                let src_y = if staging_h > cap_height {
+                                    (staging_h - cap_height) / 2
+                                } else {
+                                    0
+                                };
+                                let dst_x = if cap_width > staging_w {
+                                    (cap_width - staging_w) / 2
+                                } else {
+                                    0
+                                };
+                                let dst_y = if cap_height > staging_h {
+                                    (cap_height - staging_h) / 2
+                                } else {
+                                    0
+                                };
+                                cursor_off_x = dst_x as i32 - src_x as i32;
+                                cursor_off_y = dst_y as i32 - src_y as i32;
+                                let src_box = D3D11_BOX {
+                                    left: src_x,
+                                    top: src_y,
+                                    front: 0,
+                                    right: src_x + copy_w,
+                                    bottom: src_y + copy_h,
+                                    back: 1,
+                                };
+                                context.CopySubresourceRegion(
+                                    dst_bgra_tex,
+                                    0,
+                                    dst_x,
+                                    dst_y,
+                                    0,
+                                    stex,
+                                    0,
+                                    Some(&src_box),
+                                );
+                            }
                         }
-                    }
-                    if copied_frame {
-                        if let Some(ref mut comp) = cursor_comp {
-                            comp.composite_onto_target(
-                                &device,
-                                &context,
-                                dst_bgra_tex,
-                                dst_bgra_rtv,
-                                cap_width,
-                                cap_height,
+                        if copied_frame {
+                            if let Some(ref mut comp) = cursor_comp {
+                                comp.composite_onto_target(
+                                    &device,
+                                    &context,
+                                    dst_bgra_tex,
+                                    dst_bgra_rtv,
+                                    cap_width,
+                                    cap_height,
+                                    cap_left,
+                                    cap_top,
+                                    cursor_off_x,
+                                    cursor_off_y,
+                                );
+                            }
+                        }
+                    } else {
+                        gdi_state.ensure_init(cap_width, cap_height);
+                        if !gdi_state.dib_bits.is_null() {
+                            let _ = BitBlt(
+                                gdi_state.mem_dc,
+                                0,
+                                0,
+                                cap_width as i32,
+                                cap_height as i32,
+                                gdi_state.screen_dc,
                                 cap_left,
                                 cap_top,
-                                cursor_off_x,
-                                cursor_off_y,
+                                SRCCOPY,
+                            );
+                            crate::cursor::draw_cursor_on_gdi_dc(
+                                gdi_state.mem_dc,
+                                cap_left,
+                                cap_top,
+                                cap_width as i32,
+                                cap_height as i32,
+                            );
+                            context.UpdateSubresource(
+                                dst_bgra_tex,
+                                0,
+                                None,
+                                gdi_state.dib_bits,
+                                cap_width * 4,
+                                0,
                             );
                         }
                     }
-                } else {
-                    gdi_state.ensure_init(cap_width, cap_height);
-                    if !gdi_state.dib_bits.is_null() {
-                        let _ = BitBlt(
-                            gdi_state.mem_dc,
-                            0,
-                            0,
-                            cap_width as i32,
-                            cap_height as i32,
-                            gdi_state.screen_dc,
-                            cap_left,
-                            cap_top,
-                            SRCCOPY,
-                        );
-                        crate::cursor::draw_cursor_on_gdi_dc(
-                            gdi_state.mem_dc,
-                            cap_left,
-                            cap_top,
-                            cap_width as i32,
-                            cap_height as i32,
-                        );
-                        context.UpdateSubresource(
-                            dst_bgra_tex,
-                            0,
-                            None,
-                            gdi_state.dib_bits,
-                            cap_width * 4,
-                            0,
-                        );
-                    }
-                }
 
-                if let Some(ref conv) = nv12_conv {
-                    let _ = conv.convert_slot(ring_slot, aw_frames);
-                }
+                    if let Some(ref conv) = nv12_conv {
+                        let _ = conv.convert_slot(slot, render_seq as u32);
+                    }
+                    last_valid_ring_slot = Some(slot);
+                    slot
+                } else {
+                    last_valid_ring_slot.unwrap_or(0)
+                };
 
                 let Some(aw) = active_writer.as_mut() else {
                     outcome = CaptureSessionOutcome::NeedsRestart;
@@ -4075,5 +4153,15 @@ mod tests {
             .ends_with("_2.mp4"));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mmcss_capture_thread_guard_registers_and_reverts_cleanly() {
+        let guard = MmcssThreadGuard::new("Capture");
+        assert!(
+            guard.is_active(),
+            "AvSetMmThreadCharacteristicsW(\"Capture\") should succeed on Windows"
+        );
+        drop(guard);
     }
 }

@@ -433,6 +433,7 @@ impl VoiceRecognizer {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             std::thread::spawn(move || {
+                let _mmcss_guard = crate::engine::MmcssThreadGuard::new("Capture");
                 unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(
                         None,

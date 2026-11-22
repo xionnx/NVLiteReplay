@@ -34,7 +34,9 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent,
     UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT, VK_CAPITAL,
@@ -50,16 +52,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_USERDATA, HICON, ICONINFO,
-    IDC_ARROW, IDC_HAND, IDC_IBEAM, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    IsIconic, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    ShowWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_USERDATA, HICON,
+    ICONINFO, IDC_ARROW, IDC_HAND, IDC_IBEAM, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
+    SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_EX_APPWINDOW,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use crate::config::{
@@ -402,6 +404,7 @@ struct UiState {
     capturing_hotkey: Option<HotkeySlot>,
     caret_tick: u32,
     fast_timer_active: bool,
+    timer_interval_ms: u32,
 
     hotkey_warning: String,
     tray_added: bool,
@@ -665,36 +668,16 @@ unsafe fn create_app_icon() -> HICON {
     icon
 }
 
-unsafe fn query_process_ram_mb() -> f64 {
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcessMemoryCounters {
-        cb: u32,
-        page_fault_count: u32,
-        peak_working_set_size: usize,
-        working_set_size: usize,
-        quota_peak_paged_pool_usage: usize,
-        quota_paged_pool_usage: usize,
-        quota_peak_non_paged_pool_usage: usize,
-        quota_non_paged_pool_usage: usize,
-        pagefile_usage: usize,
-        peak_pagefile_usage: usize,
+pub(crate) unsafe fn query_process_ram_mb() -> f64 {
+    let mut pmc = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb).is_ok() {
+        pmc.WorkingSetSize as f64 / (1024.0 * 1024.0)
+    } else {
+        0.0
     }
-    if let Ok(hmod) = LoadLibraryW(PCWSTR(wide_null("psapi.dll").as_ptr())) {
-        if let Some(proc_addr) = GetProcAddress(hmod, windows::core::s!("GetProcessMemoryInfo")) {
-            type GetMemFn = unsafe extern "system" fn(*mut c_void, *mut ProcessMemoryCounters, u32) -> i32;
-            let func: GetMemFn = std::mem::transmute(proc_addr);
-            let proc_handle = windows::Win32::System::Threading::GetCurrentProcess();
-            let mut pmc = ProcessMemoryCounters {
-                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
-                ..Default::default()
-            };
-            if func(proc_handle.0, &mut pmc, pmc.cb) != 0 {
-                return pmc.working_set_size as f64 / (1024.0 * 1024.0);
-            }
-        }
-    }
-    0.0
 }
 
 unsafe fn is_other_app_fullscreen(self_hwnd: HWND) -> bool {
@@ -3126,13 +3109,30 @@ fn commit_phrase(state: &mut UiState, new_phrase: &str) {
 }
 
 unsafe fn sync_timer_rate(state: &mut UiState) {
-    let visible = IsWindowVisible(state.hwnd).as_bool();
+    let visible = IsWindowVisible(state.hwnd).as_bool() && !IsIconic(state.hwnd).as_bool();
+    if !visible {
+        if state.timer_interval_ms != 0 {
+            state.timer_interval_ms = 0;
+            state.fast_timer_active = false;
+            let _ = KillTimer(state.hwnd, TIMER_UPDATE_ID);
+        }
+        return;
+    }
+
     let voice_cfg_on = state.engine.config.lock().unwrap().voice_trigger_enabled;
     let enrolling = state.engine.voice.is_enrolling();
-    let want_fast = visible && state.active_tab == 3 && (enrolling || voice_cfg_on);
-    if want_fast != state.fast_timer_active {
+    let want_fast = state.active_tab == 3 && (enrolling || voice_cfg_on);
+    let target_ms = if want_fast { 100 } else { 250 };
+    if state.timer_interval_ms != target_ms {
+        let was_stopped = state.timer_interval_ms == 0;
+        state.timer_interval_ms = target_ms;
         state.fast_timer_active = want_fast;
-        let _ = SetTimer(state.hwnd, TIMER_UPDATE_ID, if want_fast { 100 } else { 250 }, None);
+        let _ = SetTimer(state.hwnd, TIMER_UPDATE_ID, target_ms, None);
+        if was_stopped {
+            state.last_process_ram_mb = query_process_ram_mb();
+            let game_map = state.engine.config.lock().unwrap().game_name_map.clone();
+            let _ = state.engine.refresh_foreground_game(&game_map);
+        }
     }
 }
 
@@ -3571,6 +3571,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     capturing_hotkey: None,
                     caret_tick: 0,
                     fast_timer_active: false,
+                    timer_interval_ms: 250,
                     hotkey_warning: String::new(),
                     tray_added: false,
                     last_process_ram_mb: query_process_ram_mb(),
@@ -3592,7 +3593,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_SIZE => LRESULT(0),
+        WM_SIZE | WM_SHOWWINDOW => {
+            if !ptr.is_null() {
+                let st = &mut *ptr;
+                sync_timer_rate(st);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             if !ptr.is_null() {
                 let st = &mut *ptr;
@@ -4042,5 +4049,20 @@ pub fn run(engine: Arc<ReplayEngine>) {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_get_process_memory_info_returns_valid_working_set_mb() {
+        let mb = unsafe { query_process_ram_mb() };
+        assert!(
+            mb > 0.5 && mb < 4096.0,
+            "Expected valid process working set in MB via direct GetProcessMemoryInfo, got {:.2} MB",
+            mb
+        );
     }
 }
