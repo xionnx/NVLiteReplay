@@ -5,14 +5,16 @@ use std::sync::{Arc, OnceLock};
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
-    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -52,16 +54,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    IsIconic, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     ShowWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_USERDATA, HICON,
-    ICONINFO, IDC_ARROW, IDC_HAND, IDC_IBEAM, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
-    SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_EX_APPWINDOW,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    ICONINFO, IDC_ARROW, IDC_HAND, IDC_IBEAM, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR,
+    MF_STRING, MSG, SM_CXICON, SM_CXSCREEN, SM_CXSMICON, SM_CYSCREEN, SW_HIDE, SW_RESTORE,
+    SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SHOWWINDOW, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
+    WS_CAPTION, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use crate::config::{
@@ -89,6 +91,10 @@ const ID_TRAY_UPDATE: usize = 2006;
 
 const LOGICAL_W: f32 = 680.0;
 const LOGICAL_H: f32 = 700.0;
+
+const APP_ICON_RES_ID: usize = 1;
+const BRAND_ICON_SIZE: u32 = 48;
+const BRAND_ICON_BGRA: &[u8] = include_bytes!("../assets/brand_icon_48.bgra");
 
 static UI_PTR: OnceLock<usize> = OnceLock::new();
 
@@ -369,6 +375,7 @@ struct D2DResources {
     dc_rt: Option<ID2D1DCRenderTarget>,
     rt: Option<ID2D1RenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
+    brand_bmp: Option<ID2D1Bitmap>,
     mem_dc: HDC,
     mem_bmp: HBITMAP,
     old_obj: HGDIOBJ,
@@ -391,7 +398,8 @@ struct UiState {
     engine: Arc<ReplayEngine>,
     hwnd: HWND,
     dpi_scale: f32,
-    app_icon: HICON,
+    app_icon_big: HICON,
+    app_icon_small: HICON,
     d2d: D2DResources,
 
     active_tab: usize,
@@ -469,6 +477,7 @@ unsafe fn init_d2d_resources() -> D2DResources {
         dc_rt: None,
         rt: None,
         brush: None,
+        brand_bmp: None,
         mem_dc: HDC::default(),
         mem_bmp: HBITMAP::default(),
         old_obj: HGDIOBJ::default(),
@@ -526,6 +535,25 @@ unsafe fn ensure_render_target(state: &mut UiState, w: i32, h: i32) -> bool {
                 rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                 rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
                 if let Ok(brush) = rt.CreateSolidColorBrush(&COL_TEXT, None) {
+                    let bmp_props = D2D1_BITMAP_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                    };
+                    state.d2d.brand_bmp = rt
+                        .CreateBitmap(
+                            D2D_SIZE_U {
+                                width: BRAND_ICON_SIZE,
+                                height: BRAND_ICON_SIZE,
+                            },
+                            Some(BRAND_ICON_BGRA.as_ptr() as *const c_void),
+                            BRAND_ICON_SIZE * 4,
+                            &bmp_props,
+                        )
+                        .ok();
                     state.d2d.brush = Some(brush);
                     state.d2d.dc_rt = Some(dc_rt);
                     state.d2d.rt = Some(rt);
@@ -620,7 +648,29 @@ unsafe fn apply_dark_window_frame(hwnd: HWND) {
     );
 }
 
-unsafe fn create_app_icon() -> HICON {
+unsafe fn load_app_icon_from_resource(size_px: i32) -> Option<HICON> {
+    let hinst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
+    let h = LoadImageW(
+        hinst,
+        PCWSTR(APP_ICON_RES_ID as *const u16),
+        IMAGE_ICON,
+        size_px,
+        size_px,
+        LR_DEFAULTCOLOR,
+    )
+    .ok()?;
+    if h.0.is_null() {
+        None
+    } else {
+        Some(HICON(h.0))
+    }
+}
+
+unsafe fn load_app_icon(size_px: i32) -> HICON {
+    load_app_icon_from_resource(size_px).unwrap_or_else(|| create_fallback_icon())
+}
+
+unsafe fn create_fallback_icon() -> HICON {
     let size = 32i32;
     let mut bmi = BITMAPINFO::default();
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -727,7 +777,7 @@ unsafe fn ensure_tray_icon(state: &mut UiState) {
         uID: 1,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: state.app_icon,
+        hIcon: state.app_icon_small,
         ..Default::default()
     };
     copy_str_to_wide_buf("NVLiteReplay — Instant Replay", &mut nid.szTip);
@@ -1426,27 +1476,58 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
     rt.Clear(Some(&COL_BG));
 
     // ---- 1. Top Minimalist Navigation Bar (y=0..46) ----
-    brush.SetColor(&if running { COL_EMERALD } else { COL_TEXT_SUB });
-    rt.DrawEllipse(
-        &D2D1_ELLIPSE {
-            point: D2D_POINT_2F { x: 28.0, y: 23.0 },
-            radiusX: 6.0,
-            radiusY: 6.0,
-        },
-        brush,
-        1.4,
-        None,
-    );
-    brush.SetColor(&if running { COL_EMERALD } else { COL_TEXT });
-    rt.FillEllipse(
-        &D2D1_ELLIPSE {
-            point: D2D_POINT_2F { x: 28.0, y: 23.0 },
-            radiusX: 2.3,
-            radiusY: 2.3,
-        },
-        brush,
-    );
-    draw_text(rt, brush, &d2d.fmt_brand, RectF::new(41.0, 10.0, 100.0, 26.0), "NVLiteReplay", COL_TEXT);
+    if let Some(ref bmp) = d2d.brand_bmp {
+        let icon_rect = RectF::new(16.0, 11.0, 24.0, 24.0).to_d2d();
+        rt.DrawBitmap(
+            bmp,
+            Some(&icon_rect),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
+        if running {
+            brush.SetColor(&COL_BG);
+            rt.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: D2D_POINT_2F { x: 38.0, y: 32.0 },
+                    radiusX: 4.0,
+                    radiusY: 4.0,
+                },
+                brush,
+            );
+            brush.SetColor(&COL_EMERALD);
+            rt.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: D2D_POINT_2F { x: 38.0, y: 32.0 },
+                    radiusX: 2.6,
+                    radiusY: 2.6,
+                },
+                brush,
+            );
+        }
+    } else {
+        brush.SetColor(&if running { COL_EMERALD } else { COL_TEXT_SUB });
+        rt.DrawEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: 28.0, y: 23.0 },
+                radiusX: 6.0,
+                radiusY: 6.0,
+            },
+            brush,
+            1.4,
+            None,
+        );
+        brush.SetColor(&if running { COL_EMERALD } else { COL_TEXT });
+        rt.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: 28.0, y: 23.0 },
+                radiusX: 2.3,
+                radiusY: 2.3,
+            },
+            brush,
+        );
+    }
+    draw_text(rt, brush, &d2d.fmt_brand, RectF::new(45.0, 10.0, 98.0, 26.0), "NVLiteReplay", COL_TEXT);
 
     let tabs = [
         (0, R_TAB_0, "Video"),
@@ -1755,6 +1836,7 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
     }
 
     if rt.EndDraw(None, None).is_err() {
+        state.d2d.brand_bmp = None;
         state.d2d.brush = None;
         state.d2d.rt = None;
         state.d2d.dc_rt = None;
@@ -3631,13 +3713,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let dpi_scale = if dpi_x > 0 { dpi_x as f32 / 96.0 } else { 1.0 };
 
                 let initial_phrase = engine.config.lock().unwrap().voice_phrase.clone();
-                let app_icon = create_app_icon();
+                let big_px = GetSystemMetrics(SM_CXICON).max(32);
+                let small_px = GetSystemMetrics(SM_CXSMICON).max(16);
+                let app_icon_big = load_app_icon(big_px);
+                let app_icon_small = load_app_icon(small_px);
                 let d2d = init_d2d_resources();
                 let mut state = Box::new(UiState {
                     engine,
                     hwnd,
                     dpi_scale,
-                    app_icon,
+                    app_icon_big,
+                    app_icon_small,
                     d2d,
                     active_tab: 0,
                     hover_x: -100.0,
@@ -3658,8 +3744,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 });
 
                 apply_dark_window_frame(hwnd);
-                SendMessageW(hwnd, 0x0080, WPARAM(1), LPARAM(state.app_icon.0 as isize));
-                SendMessageW(hwnd, 0x0080, WPARAM(0), LPARAM(state.app_icon.0 as isize));
+                SendMessageW(hwnd, 0x0080, WPARAM(1), LPARAM(state.app_icon_big.0 as isize));
+                SendMessageW(hwnd, 0x0080, WPARAM(0), LPARAM(state.app_icon_small.0 as isize));
 
                 register_hotkeys(&mut state);
                 ensure_tray_icon(&mut state);
@@ -4052,7 +4138,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 boxed.engine.stop();
                 remove_tray_icon(&mut boxed);
                 release_backbuffer(&mut boxed.d2d);
-                let _ = DestroyIcon(boxed.app_icon);
+                let _ = DestroyIcon(boxed.app_icon_big);
+                let _ = DestroyIcon(boxed.app_icon_small);
                 SetWindowLongPtrW(hwnd, GWL_USERDATA, 0);
             }
             PostQuitMessage(0);
@@ -4077,6 +4164,8 @@ pub fn run(engine: Arc<ReplayEngine>, start_minimized: bool) {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinst,
+            hIcon: load_app_icon(GetSystemMetrics(SM_CXICON).max(32)),
+            hIconSm: load_app_icon(GetSystemMetrics(SM_CXSMICON).max(16)),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
@@ -4143,5 +4232,28 @@ mod tests {
             "Expected valid process working set in MB via direct GetProcessMemoryInfo, got {:.2} MB",
             mb
         );
+    }
+
+    #[test]
+    fn embedded_app_icon_resource_loads_and_brand_bgra_valid() {
+        assert_eq!(
+            BRAND_ICON_BGRA.len(),
+            (BRAND_ICON_SIZE * BRAND_ICON_SIZE * 4) as usize
+        );
+        // Outer corner must be transparent (alpha == 0) and center opaque (alpha == 255).
+        assert_eq!(BRAND_ICON_BGRA[3], 0);
+        let center_idx = ((24 * BRAND_ICON_SIZE + 24) * 4 + 3) as usize;
+        assert_eq!(BRAND_ICON_BGRA[center_idx], 255);
+
+        unsafe {
+            let big = load_app_icon_from_resource(32)
+                .expect("Embedded RT_GROUP_ICON id=1 should load at 32x32");
+            let small = load_app_icon_from_resource(16)
+                .expect("Embedded RT_GROUP_ICON id=1 should load at 16x16");
+            assert!(!big.0.is_null());
+            assert!(!small.0.is_null());
+            let _ = DestroyIcon(big);
+            let _ = DestroyIcon(small);
+        }
     }
 }
