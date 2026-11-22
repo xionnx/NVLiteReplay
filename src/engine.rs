@@ -40,26 +40,28 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_High,
-    eAVEncH265VProfile_Main_420_8, ICodecAPI, IMFActivate, IMFByteStream, IMFDXGIDeviceManager,
-    IMFMediaBuffer, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader, MFAudioFormat_AAC,
-    MFAudioFormat_PCM, MFCreateAttributes, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMFByteStreamOnStream, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFCreateSinkWriterFromURL, MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL,
-    MFMediaType_Audio, MFMediaType_Video, MFNominalRange_0_255, MFNominalRange_16_235, MFShutdown,
-    MFStartup, MFTEnumEx, MFVideoFormat_ARGB32, MFVideoFormat_AV1, MFVideoFormat_H264,
-    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT709, CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVGOPSize, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO, MF_LOW_LATENCY,
-    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
-    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SINK_WRITER_D3D_MANAGER,
-    MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
+    eAVEncH265VProfile_Main_420_8, ICodecAPI, IMFActivate, IMFAttributes, IMFByteStream,
+    IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader,
+    MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMFByteStreamOnStream, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL,
+    MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    MFMediaType_Video, MFNominalRange_0_255, MFNominalRange_16_235, MFShutdown, MFStartup,
+    MFTEnumEx, MFVideoFormat_ARGB32, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoFormat_NV12, MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVGOPSize,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_REGISTER_TYPE_INFO, MF_LOW_LATENCY, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+    MF_SINK_WRITER_D3D_MANAGER, MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
 };
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Com::{
@@ -2229,12 +2231,57 @@ unsafe fn apply_bt709_color_attributes(mt: &IMFMediaType, studio_yuv: bool) {
     }
 }
 
-/// Universal hardware MFT tuning via ICodecAPI (works across NVIDIA NVENC, AMD AMF, Intel QSV).
-unsafe fn configure_encoder_codec_api(
-    sink_writer: &IMFSinkWriter,
-    video_stream_index: u32,
+/// Computes Peak-Constrained VBR rate-control parameters so calm scenes drop far below
+/// target bitrate while heavy action stays strictly bounded within the user's bitrate cap.
+/// Returns `(mean_bps, max_bps, vbv_buffer_bytes, gop_frames)`.
+fn compute_vbr_params(bitrate_bps: u32, fps: u32) -> (u32, u32, u32, u32) {
+    let max_bps = bitrate_bps.clamp(2_000_000, 60_000_000);
+    // Keep mean ~90% of max (~1.11x peak/mean ratio): satisfies NVIDIA/AMD/Intel Peak-VBR
+    // requirement (max > mean) while compensating for 5s cold-segment IDR overhead so
+    // sustained heavy action never balloons past the chosen bitrate.
+    let mean_bps = ((max_bps as u64).saturating_mul(9) / 10).max(1_500_000) as u32;
+    // CODECAPI_AVEncCommonBufferSize is in BYTES (~0.5s VBV window prevents cold-start bursts).
+    let vbv_buffer_bytes = (max_bps / 16).clamp(250_000, 4_000_000);
+    let gop_frames = fps.saturating_mul(2).clamp(30, 240);
+    (mean_bps, max_bps, vbv_buffer_bytes, gop_frames)
+}
+
+/// Builds `pEncodingParameters` passed directly to `IMFSinkWriter::SetInputMediaType`.
+/// Hardware MFTs (notably NVIDIA NVENC) lock rate-control/GOP/VBV parameters inside
+/// `SetInputMediaType` and silently ignore post-hoc `ICodecAPI::SetValue` calls.
+unsafe fn build_encoder_attributes(
+    codec: VideoCodecType,
     bitrate_bps: u32,
     fps: u32,
+) -> Option<IMFAttributes> {
+    let (mean_bps, max_bps, vbv_bytes, gop_frames) = compute_vbr_params(bitrate_bps, fps);
+    let mut attrs = None;
+    MFCreateAttributes(&mut attrs, 8).ok()?;
+    let attrs = attrs?;
+    let _ = attrs.SetUINT32(
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+    );
+    let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, mean_bps);
+    let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, max_bps);
+    let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonBufferSize, vbv_bytes);
+    let _ = attrs.SetUINT32(&CODECAPI_AVEncMPVGOPSize, gop_frames);
+    let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, 70u32);
+    if codec == VideoCodecType::HardwareH264 {
+        let _ = attrs.SetUINT32(&CODECAPI_AVEncH264CABACEnable, 1u32);
+    }
+    Some(attrs)
+}
+
+/// Verifies (via `ICodecAPI::GetValue`) that Peak-VBR & 2s GOP took effect, and falls back
+/// to `ICodecAPI::SetValue` on MFTs where `pEncodingParameters` was rejected or deferred.
+unsafe fn verify_or_configure_encoder_codec_api(
+    sink_writer: &IMFSinkWriter,
+    video_stream_index: u32,
+    codec: VideoCodecType,
+    bitrate_bps: u32,
+    fps: u32,
+    used_enc_params: bool,
 ) -> bool {
     let mut raw_api: *mut std::ffi::c_void = null_mut();
     let guid_null = GUID::zeroed();
@@ -2248,31 +2295,35 @@ unsafe fn configure_encoder_codec_api(
         .is_err()
         || raw_api.is_null()
     {
-        return false;
+        return used_enc_params;
     }
     let codec_api = ICodecAPI::from_raw(raw_api);
+    let (mean_bps, max_bps, vbv_bytes, gop_frames) = compute_vbr_params(bitrate_bps, fps);
+    let want_rc = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
 
-    let v_rc = VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
-    let rc_ok = codec_api
-        .SetValue(&CODECAPI_AVEncCommonRateControlMode, &v_rc)
-        .is_ok();
+    let read_u32 = |key: &GUID| -> Option<u32> {
+        let val = codec_api.GetValue(key).ok()?;
+        u32::try_from(&val).ok()
+    };
 
-    let v_mean = VARIANT::from(bitrate_bps);
-    let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v_mean);
+    let mut rc_active = read_u32(&CODECAPI_AVEncCommonRateControlMode) == Some(want_rc);
+    let mut gop_active = read_u32(&CODECAPI_AVEncMPVGOPSize) == Some(gop_frames);
 
-    let peak_bps = ((bitrate_bps as u64).saturating_mul(3) / 2)
-        .clamp(bitrate_bps as u64, 100_000_000) as u32;
-    let v_max = VARIANT::from(peak_bps);
-    let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &v_max);
+    if !used_enc_params || (!rc_active && !gop_active) {
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(want_rc));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(mean_bps));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &VARIANT::from(max_bps));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &VARIANT::from(vbv_bytes));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop_frames));
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(70u32));
+        if codec == VideoCodecType::HardwareH264 {
+            let _ = codec_api.SetValue(&CODECAPI_AVEncH264CABACEnable, &VARIANT::from(1u32));
+        }
+        rc_active = read_u32(&CODECAPI_AVEncCommonRateControlMode) == Some(want_rc);
+        gop_active = read_u32(&CODECAPI_AVEncMPVGOPSize) == Some(gop_frames);
+    }
 
-    let gop_frames = fps.saturating_mul(2).clamp(30, 240);
-    let v_gop = VARIANT::from(gop_frames);
-    let gop_ok = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &v_gop).is_ok();
-
-    let v_qvs = VARIANT::from(70u32);
-    let _ = codec_api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &v_qvs);
-
-    rc_ok || gop_ok
+    rc_active || gop_active
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2395,8 +2446,9 @@ unsafe fn create_segment_writer(
         VideoCodecType::HardwareHEVC => MFVideoFormat_HEVC,
         VideoCodecType::HardwareH264 => MFVideoFormat_H264,
     };
+    let (mean_bps, _, _, _) = compute_vbr_params(bitrate_bps, fps);
     let _ = video_out.SetGUID(&MF_MT_SUBTYPE, &subtype);
-    let _ = video_out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps);
+    let _ = video_out.SetUINT32(&MF_MT_AVG_BITRATE, mean_bps);
     let _ = video_out.SetUINT32(&MF_MT_INTERLACE_MODE, 2);
     let _ = video_out.SetUINT64(&MF_MT_FRAME_SIZE, out_frame_size);
     let _ = video_out.SetUINT64(&MF_MT_FRAME_RATE, frame_rate);
@@ -2470,10 +2522,27 @@ unsafe fn create_segment_writer(
     let _ = video_in.SetUINT64(&MF_MT_FRAME_RATE, frame_rate);
     apply_bt709_color_attributes(&video_in, use_nv12);
 
-    if sink_writer
-        .SetInputMediaType(video_stream_index, &video_in, None)
-        .is_err()
-    {
+    let enc_attrs = build_encoder_attributes(codec, bitrate_bps, fps);
+    let mut used_enc_params = false;
+    let set_in_ok = if let Some(ref ea) = enc_attrs {
+        if sink_writer
+            .SetInputMediaType(video_stream_index, &video_in, Some(ea))
+            .is_ok()
+        {
+            used_enc_params = true;
+            true
+        } else {
+            sink_writer
+                .SetInputMediaType(video_stream_index, &video_in, None)
+                .is_ok()
+        }
+    } else {
+        sink_writer
+            .SetInputMediaType(video_stream_index, &video_in, None)
+            .is_ok()
+    };
+
+    if !set_in_ok {
         release_disk_on_fail(sink_writer, disk_path);
         if let Some((fb_codec, fb_prof)) = next_fallback(codec, force_profile) {
             return create_segment_writer(
@@ -2512,7 +2581,14 @@ unsafe fn create_segment_writer(
         return None;
     }
 
-    let vbr_tuned = configure_encoder_codec_api(&sink_writer, video_stream_index, bitrate_bps, fps);
+    let vbr_tuned = verify_or_configure_encoder_codec_api(
+        &sink_writer,
+        video_stream_index,
+        codec,
+        bitrate_bps,
+        fps,
+        used_enc_params,
+    );
 
     let mut has_audio = enable_audio;
     let mut audio_stream_index = 0u32;
@@ -3275,6 +3351,303 @@ mod tests {
             assert!(ok && msz > 10_000, "36-segment merge failed (ok={ok}, size={msz})");
         }
         drop(segs36);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vbr_params_cap_and_gop_bounds() {
+        for (mbps, fps) in [(4, 30), (8, 60), (12, 60), (20, 60), (35, 120), (50, 120)] {
+            let target = mbps * 1_000_000;
+            let (mean, max, vbv, gop) = compute_vbr_params(target, fps);
+            assert!(mean < max, "Peak-VBR requires max > mean ({mean} vs {max})");
+            assert_eq!(max, target, "Peak bitrate must not exceed user-selected bitrate");
+            assert!(vbv >= 250_000 && vbv <= max / 8, "VBV buffer must be in bytes (<= 1s): {vbv}");
+            assert_eq!(gop, (fps * 2).clamp(30, 240));
+        }
+    }
+
+    #[test]
+    fn hardware_encoder_applies_peak_vbr_gop_and_prevents_bitrate_bloat() {
+        use windows::Win32::Media::MediaFoundation::MFSampleExtension_CleanPoint;
+
+        let tmp = std::env::temp_dir().join("NVLiteReplayRust_PeakVbrRegression");
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::create_dir_all(&tmp);
+
+        unsafe {
+            let _com = ComMfGuard::new(false);
+            let mut dev_opt: Option<ID3D11Device> = None;
+            let mut ctx_opt: Option<ID3D11DeviceContext> = None;
+            let levels = [D3D_FEATURE_LEVEL_11_0];
+            let _ = D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&levels),
+                D3D11_SDK_VERSION,
+                Some(&mut dev_opt),
+                None,
+                Some(&mut ctx_opt),
+            );
+            let dev = dev_opt.expect("D3D11 device");
+            let ctx = ctx_opt.expect("D3D11 ctx");
+            if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
+                let _ = mt.SetMultithreadProtected(true);
+            }
+            let mut token = 0u32;
+            let mut mgr_opt: Option<IMFDXGIDeviceManager> = None;
+            let _ = MFCreateDXGIDeviceManager(&mut token, &mut mgr_opt);
+            if let Some(ref mgr) = mgr_opt {
+                let _ = mgr.ResetDevice(&dev, token);
+            }
+
+            let w = 1920u32;
+            let h = 1080u32;
+            let bgra_desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let nv12_desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut ctex_opt: Option<ID3D11Texture2D> = None;
+            dev.CreateTexture2D(&bgra_desc, None, Some(&mut ctex_opt)).unwrap();
+            let ctex = ctex_opt.unwrap();
+            let mut nv12_ring = Vec::new();
+            let mut nv12_bufs = Vec::new();
+            for _ in 0..4 {
+                let mut nt: Option<ID3D11Texture2D> = None;
+                dev.CreateTexture2D(&nv12_desc, None, Some(&mut nt)).unwrap();
+                let ntex = nt.unwrap();
+                let buf = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &ntex, 0, false).unwrap();
+                let _ = buf.SetCurrentLength(w * h * 3 / 2);
+                nv12_ring.push(ntex);
+                nv12_bufs.push(buf);
+            }
+            let conv = GpuNv12Converter::new(&dev, &ctx, &ctex, &nv12_ring, w, h, w, h, 60).unwrap();
+
+            // Calm desktop-like frames (low motion)
+            let mut calm_frames = Vec::new();
+            for idx in 0..2u32 {
+                let mut f = vec![0u8; (w * h * 4) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = ((y * w + x) * 4) as usize;
+                        f[off] = ((x * 255) / w) as u8;
+                        f[off + 1] = ((y * 255) / h) as u8;
+                        f[off + 2] = 50;
+                        f[off + 3] = 255;
+                    }
+                }
+                for dy in 0..12usize {
+                    for dx in 0..12usize {
+                        let off = (((100 + dy) * w as usize + 100 + idx as usize * 6 + dx) * 4) as usize;
+                        f[off] = 255;
+                        f[off + 1] = 255;
+                        f[off + 2] = 255;
+                    }
+                }
+                calm_frames.push(f);
+            }
+
+            // Heavy-action detailed frames (high motion)
+            let mut act_frames = Vec::new();
+            for idx in 0..4u32 {
+                let mut f = vec![0u8; (w * h * 4) as usize];
+                let mut rng: u32 = 0xDEAD_BEEF ^ idx.wrapping_mul(0x9E37_79B9);
+                for y in 0..h {
+                    for x in 0..w {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 17;
+                        rng ^= rng << 5;
+                        let off = ((y * w + x) * 4) as usize;
+                        let vx = x.wrapping_add(idx * 23);
+                        let vy = y.wrapping_add(idx * 11);
+                        f[off] = (((vx ^ vy) & 0x7F) as u8).saturating_add((rng & 0x1F) as u8);
+                        f[off + 1] = (((vx.wrapping_mul(3) + vy) & 0x7F) as u8)
+                            .saturating_add(((rng >> 8) & 0x1F) as u8);
+                        f[off + 2] = (((vx + vy.wrapping_mul(5)) & 0x7F) as u8)
+                            .saturating_add(((rng >> 16) & 0x1F) as u8);
+                        f[off + 3] = 255;
+                    }
+                }
+                act_frames.push(f);
+            }
+
+            let caps = probe_hardware_codec_caps();
+            let mut codecs = vec![VideoCodecType::HardwareH264];
+            if caps.hevc_hw {
+                codecs.push(VideoCodecType::HardwareHEVC);
+            }
+
+            for codec in codecs {
+                let target_mbps = 20u32;
+                let target_bps = target_mbps * 1_000_000;
+                let mut action_segs = Vec::new();
+                let mut action_sum = 0u64;
+
+                for (is_action, frames) in [(false, &calm_frames), (true, &act_frames)] {
+                    let seg_count = if is_action { 2 } else { 1 };
+                    for sidx in 0..seg_count {
+                        let mut wr = create_segment_writer(
+                            mgr_opt.as_ref(),
+                            w,
+                            h,
+                            w,
+                            h,
+                            60,
+                            target_bps,
+                            is_action,
+                            BufferStorageMode::DiskTempBuffer,
+                            &tmp,
+                            codec,
+                            true,
+                            true,
+                        )
+                        .expect("create_segment_writer");
+                        assert!(
+                            wr.vbr_tuned,
+                            "{:?}: Peak-VBR / GOP tuning must actually take effect via pEncodingParameters",
+                            codec
+                        );
+
+                        let dur_hns = 10_000_000 / 60i64;
+                        let pcm = vec![0u8; 960 * 2 * 2];
+                        let mut audio_written = 0i64;
+                        for f in 0..300u32 {
+                            let slot = (f as usize) & 3;
+                            let pix = &frames[(f as usize) % frames.len()];
+                            ctx.UpdateSubresource(&ctex, 0, None, pix.as_ptr() as *const _, w * 4, 0);
+                            let _ = conv.convert_slot(slot, f);
+                            let sample = MFCreateSample().unwrap();
+                            let vts = f as i64 * dur_hns;
+                            let _ = sample.SetSampleTime(vts);
+                            let _ = sample.SetSampleDuration(dur_hns);
+                            let _ = sample.AddBuffer(&nv12_bufs[slot]);
+                            wr.sink_writer.WriteSample(wr.video_stream_index, &sample).unwrap();
+
+                            // Interleave 20ms AAC chunks with video frames (matches capture_loop).
+                            if is_action && wr.has_audio {
+                                while audio_written * 200_000 <= vts {
+                                    let abuf = MFCreateMemoryBuffer(pcm.len() as u32).unwrap();
+                                    let mut ptr = null_mut();
+                                    abuf.Lock(&mut ptr, None, None).unwrap();
+                                    std::ptr::copy_nonoverlapping(pcm.as_ptr(), ptr, pcm.len());
+                                    abuf.Unlock().unwrap();
+                                    abuf.SetCurrentLength(pcm.len() as u32).unwrap();
+                                    let asamp = MFCreateSample().unwrap();
+                                    asamp.SetSampleTime(audio_written * 200_000).unwrap();
+                                    asamp.SetSampleDuration(200_000).unwrap();
+                                    asamp.AddBuffer(&abuf).unwrap();
+                                    wr.sink_writer.WriteSample(wr.audio_stream_index, &asamp).unwrap();
+                                    audio_written += 1;
+                                }
+                            }
+                        }
+                        wr.sink_writer.Finalize().unwrap();
+                        let path = wr.disk_path.take().unwrap();
+                        drop(wr);
+
+                        let sz = fs::metadata(&path).unwrap().len();
+                        let eff_mbps = (sz as f64 * 8.0) / 5.0 / 1_000_000.0;
+
+                        // Verify GOP 2s in actual bitstream (<= 3 keyframes in a 5s segment, never 5!)
+                        let url = HSTRING::from(path.to_string_lossy().as_ref());
+                        let mut keyframes = 0u32;
+                        if let Ok(r) = MFCreateSourceReaderFromURL(&url, None) {
+                            let vs = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+                            let _ = r.SetStreamSelection(vs, true);
+                            loop {
+                                let mut fl = 0u32;
+                                let mut ts = 0i64;
+                                let mut sa = None;
+                                if r.ReadSample(vs, 0, None, Some(&mut fl), Some(&mut ts), Some(&mut sa)).is_err() {
+                                    break;
+                                }
+                                if (fl & (MF_SOURCE_READERF_ERROR.0 as u32 | MF_SOURCE_READERF_ENDOFSTREAM.0 as u32)) != 0 {
+                                    break;
+                                }
+                                if let Some(s) = sa {
+                                    if s.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0 {
+                                        keyframes += 1;
+                                    }
+                                }
+                            }
+                        }
+                        assert!(
+                            keyframes <= 3,
+                            "{:?}: expected GOP 2s (<=3 keyframes in 5s), got {}",
+                            codec,
+                            keyframes
+                        );
+
+                        if !is_action {
+                            assert!(
+                                eff_mbps < (target_mbps as f64) * 0.50,
+                                "{:?}: calm scene VBR should drop below 50% of {} Mbps, got {:.2} Mbps",
+                                codec,
+                                target_mbps,
+                                eff_mbps
+                            );
+                            let _ = fs::remove_file(&path);
+                        } else {
+                            assert!(
+                                eff_mbps <= (target_mbps as f64) * 1.12,
+                                "{:?}: heavy action exceeded bitrate cap ({} Mbps), got {:.2} Mbps",
+                                codec,
+                                target_mbps,
+                                eff_mbps
+                            );
+                            action_sum += sz;
+                            action_segs.push(ReplaySegment {
+                                seq_id: sidx as u64 + 1,
+                                ram_data: None,
+                                disk_file: Some(DiskTempFile::new(path)),
+                                size_bytes: sz,
+                                duration_seconds: 5.0,
+                            });
+                        }
+                    }
+                }
+
+                let merged = tmp.join(format!("merged_{:?}.mp4", codec));
+                assert!(
+                    merge_segments_pure_native(&action_segs, &merged, 60),
+                    "{:?}: merge failed",
+                    codec
+                );
+                let merged_sz = fs::metadata(&merged).unwrap().len();
+                let ratio = merged_sz as f64 / action_sum.max(1) as f64;
+                assert!(
+                    ratio <= 1.02 && ratio >= 0.95,
+                    "{:?}: stream-copy merge size drift ratio={:.3} (sum={}, merged={})",
+                    codec,
+                    ratio,
+                    action_sum,
+                    merged_sz
+                );
+                drop(action_segs);
+                let _ = fs::remove_file(&merged);
+            }
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 }

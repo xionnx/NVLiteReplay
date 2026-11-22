@@ -1892,7 +1892,24 @@ unsafe fn paint_tab_video(
     draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 534.0, 268.0, 34.0), res_label, dim_alpha);
     draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(306.0, 534.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 514.0, 260.0, 16.0), "BITRATE VIDEO", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 514.0, 120.0, 16.0), "BITRATE VIDEO", COL_TEXT_MUTED);
+    let est_max_mb = (cfg.bitrate_mbps as f64 + 0.192)
+        * (cfg.replay_duration_seconds as f64)
+        / 8.0
+        / 1.048_576;
+    let est_label = if est_max_mb >= 1024.0 {
+        format!("Maks ~{:.2} GB", est_max_mb / 1024.0)
+    } else {
+        format!("Maks ~{:.0} MB", est_max_mb)
+    };
+    draw_text(
+        rt,
+        brush,
+        &d2d.fmt_right_small,
+        RectF::new(470.0, 514.0, 190.0, 16.0),
+        &est_label,
+        if est_max_mb >= 750.0 { COL_AMBER } else { COL_TEXT_MUTED },
+    );
     let br_label = BITRATE_OPTIONS
         .iter()
         .find(|&&(b, _)| b == cfg.bitrate_mbps)
@@ -1917,7 +1934,7 @@ unsafe fn paint_tab_video(
     let pipe_desc = if running && pipe_status != "Standby" {
         pipe_status.to_string()
     } else {
-        "NV12 GPU BT.709 · Peak-VBR 1.5x · GOP 2 dtk".to_string()
+        "NV12 GPU BT.709 · Peak-VBR · GOP 2 dtk".to_string()
     };
     draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(196.0, 602.0, 464.0, 18.0), &pipe_desc, COL_TEXT_SUB);
 }

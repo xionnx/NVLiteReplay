@@ -35,7 +35,7 @@ Aplikasi Instant Replay ultra-ringan dalam satu file portable tanpa service back
 | :--- | :--- |
 | **Screen Capture** | `DXGI Desktop Duplication` + komposit kursor GPU (*fallback* GDI otomatis) |
 | **Color & Scaling** | `ID3D11VideoProcessor` hardware `BGRA -> NV12` standar **BT.709** (Studio 16–235) |
-| **Hardware Encoder** | Media Foundation Hardware MFT + tuning `ICodecAPI` (**Peak-VBR 1.5x**, **GOP 2 dtk**) |
+| **Hardware Encoder** | Media Foundation Hardware MFT + tuning `ICodecAPI` (**Peak-VBR terkendali**, **GOP 2 dtk**) |
 | **Codec Didukung** | **H.264 High Profile**, **HEVC (H.265)**, dan **AV1** *(auto-detect kemampuan GPU)* |
 | **Rolling Buffer** | **RAM Ring Buffer** (0% tulis SSD saat standby) atau **Disk Temp Buffer** (custom folder) |
 | **Audio Mixing** | **WASAPI Loopback 48 kHz** (Desktop) + Mikrofon (pilihan input custom & *soft-limiter*) |
