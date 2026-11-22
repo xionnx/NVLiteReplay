@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, HSTRING, PCWSTR, VARIANT};
-use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
@@ -71,7 +71,10 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Diagnostics::Debug::Beep;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, GetCurrentProcess, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, PostMessageW};
 
@@ -155,7 +158,7 @@ impl Drop for DiskTempFile {
 #[derive(Clone)]
 pub struct ReplaySegment {
     pub seq_id: u64,
-    pub ram_data: Option<Vec<u8>>,
+    pub ram_data: Option<Arc<[u8]>>,
     pub disk_file: Option<Arc<DiskTempFile>>,
     pub size_bytes: u64,
     pub duration_seconds: f64,
@@ -172,19 +175,15 @@ impl ReplaySegment {
 }
 
 struct ComMfGuard {
-    with_timer: bool,
     com_owned: bool,
 }
 
 impl ComMfGuard {
-    unsafe fn new(with_timer: bool) -> Self {
+    unsafe fn new() -> Self {
         // RPC_E_CHANGED_MODE on an STA thread (UI) must not be paired with CoUninitialize.
         let com_owned = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        if with_timer {
-            timeBeginPeriod(1);
-        }
         let _ = MFStartup(MF_VERSION, 0);
-        Self { with_timer, com_owned }
+        Self { com_owned }
     }
 }
 
@@ -192,11 +191,82 @@ impl Drop for ComMfGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = MFShutdown();
-            if self.with_timer {
-                timeEndPeriod(1);
-            }
             if self.com_owned {
                 CoUninitialize();
+            }
+        }
+    }
+}
+
+/// High-resolution kernel waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Win10 1803+)
+/// for sub-millisecond frame pacing with zero busy-wait spin CPU burn.
+/// Falls back cleanly to `timeBeginPeriod(1)` + `thread::sleep` on older Windows builds.
+struct HighResWaitableTimer {
+    handle: Option<HANDLE>,
+    legacy_timer_period: bool,
+}
+
+impl HighResWaitableTimer {
+    unsafe fn new() -> Self {
+        // TIMER_ALL_ACCESS (0x001F0003) grants SYNCHRONIZE + TIMER_MODIFY_STATE.
+        const TIMER_ACCESS: u32 = 0x001F_0003;
+        if let Ok(h) = CreateWaitableTimerExW(
+            None,
+            PCWSTR::null(),
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ACCESS,
+        ) {
+            if !h.is_invalid() {
+                return Self {
+                    handle: Some(h),
+                    legacy_timer_period: false,
+                };
+            }
+        }
+        // Fallback for Windows builds prior to 10 1803: enable 1 ms sleep granularity.
+        timeBeginPeriod(1);
+        Self {
+            handle: None,
+            legacy_timer_period: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_high_res(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Sleeps for `remaining_ms` (positive) using the high-resolution waitable timer
+    /// without any CPU spin-loop.
+    unsafe fn wait_ms(&self, remaining_ms: f64) {
+        if remaining_ms < 0.1 {
+            return;
+        }
+        // Cap single wait to 50 ms so `stop()` remains immediately responsive.
+        let clamped_ms = remaining_ms.min(50.0);
+        if let Some(h) = self.handle {
+            // Negative due time = relative wait in 100-nanosecond intervals (1 ms = 10,000 units).
+            let due_100ns = -((clamped_ms * 10_000.0).round() as i64).max(1);
+            if SetWaitableTimer(h, &due_100ns, 0, None, None, false).is_ok() {
+                let _ = WaitForSingleObject(h, INFINITE);
+                return;
+            }
+        }
+        let sleep_ms = clamped_ms.floor() as u64;
+        if sleep_ms > 0 {
+            thread::sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+}
+
+impl Drop for HighResWaitableTimer {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(h) = self.handle.take() {
+                let _ = CloseHandle(h);
+            }
+            if self.legacy_timer_period {
+                timeEndPeriod(1);
             }
         }
     }
@@ -793,7 +863,7 @@ impl ReplayEngine {
 
         let engine = Arc::clone(self);
         thread::spawn(move || {
-            let _mf_guard = unsafe { ComMfGuard::new(false) };
+            let _mf_guard = unsafe { ComMfGuard::new() };
             engine.raise_status("Menyimpan Instant Replay...".to_string());
 
             {
@@ -949,7 +1019,7 @@ impl ReplayEngine {
                         data.truncate(bytes_read as usize);
                         if !data.is_empty() {
                             seg.size_bytes = data.len() as u64;
-                            seg.ram_data = Some(data);
+                            seg.ram_data = Some(Arc::from(data.into_boxed_slice()));
                         }
                     }
                 }
@@ -980,14 +1050,10 @@ impl ReplayEngine {
                 drop(seg);
                 return false;
             }
-            let (max_dur, cur_mode) = {
+            let max_dur = {
                 let cfg = self.config.lock().unwrap();
-                (
-                    (cfg.replay_duration_seconds + cfg.segment_duration_seconds) as f64,
-                    cfg.storage_mode,
-                )
+                (cfg.replay_duration_seconds + cfg.segment_duration_seconds) as f64
             };
-            let mut evicted = false;
             let mut evicted_segs = Vec::new();
             {
                 let mut segs = self.segments.lock().unwrap();
@@ -1002,17 +1068,15 @@ impl ReplayEngine {
                             break;
                         }
                         evicted_segs.push(segs.remove(0));
-                        evicted = true;
                     }
                 }
             }
             // Drop evicted segments outside the mutex; Arc<DiskTempFile> deletes unpinned files immediately
             // while keeping files currently being merged by save_replay_async alive until merge completes.
+            // Note: do NOT call EmptyWorkingSet here — trimming on every 5s eviction pages out active
+            // ring-buffer RAM segments to pagefile.sys; working set is trimmed once in finish_stop().
             drop(evicted_segs);
             self.consecutive_seg_failures.store(0, Ordering::Release);
-            if evicted && cur_mode == BufferStorageMode::RamRingBuffer {
-                trim_working_set();
-            }
             true
         }
     }
@@ -1050,7 +1114,7 @@ impl ReplayEngine {
             }
         }
 
-        let _com_mf_guard = unsafe { ComMfGuard::new(true) };
+        let _com_mf_guard = unsafe { ComMfGuard::new() };
         let _exit_guard = CaptureExitGuard {
             engine: Arc::clone(&engine),
         };
@@ -1446,6 +1510,7 @@ impl ReplayEngine {
 
             let frame_dur_hns: i64 = 10_000_000 / fps as i64;
             let frame_interval_ms: f64 = 1000.0 / fps as f64;
+            let pacing_timer = HighResWaitableTimer::new();
             let loop_clock = Instant::now();
             let mut fps_timer = Instant::now();
             let mut seg_audio_clock = Instant::now();
@@ -1464,13 +1529,7 @@ impl ReplayEngine {
                 let target_ms = next_frame_tick as f64 * frame_interval_ms;
                 let now_ms = loop_clock.elapsed().as_secs_f64() * 1000.0;
                 if now_ms < target_ms {
-                    let sleep_ms = (target_ms - now_ms) as u64;
-                    if sleep_ms > 1 {
-                        thread::sleep(Duration::from_millis(sleep_ms - 1));
-                    }
-                    while loop_clock.elapsed().as_secs_f64() * 1000.0 < target_ms {
-                        std::hint::spin_loop();
-                    }
+                    pacing_timer.wait_ms(target_ms - now_ms);
                     next_frame_tick += 1;
                 } else if now_ms > target_ms + 250.0 {
                     // Resync frame pacing after disk stalls, sleep/wake, or game load screens
@@ -1500,7 +1559,7 @@ impl ReplayEngine {
                         prewarm_handle = thread::Builder::new()
                             .name("NVLiteReplayRust_Prewarm".to_string())
                             .spawn(move || {
-                                let _mf_guard = ComMfGuard::new(false);
+                                let _mf_guard = ComMfGuard::new();
                                 let mgr_wrapped = mgr_wrapped;
                                 let built = create_segment_writer(
                                     mgr_wrapped.0.as_ref(),
@@ -2012,7 +2071,7 @@ impl ReplayEngine {
                         if let Ok(jh) = thread::Builder::new()
                             .name("NVLiteReplayRust_FinalizeSeg".to_string())
                             .spawn(move || {
-                                let _mf_guard = ComMfGuard::new(false);
+                                let _mf_guard = ComMfGuard::new();
                                 if let Some(fw) = fin_bg.lock().ok().and_then(|mut g| g.take()) {
                                     let _ = eng_bg.finalize_and_store_segment(fw, fps, storage_mode);
                                 }
@@ -2181,7 +2240,7 @@ unsafe fn try_create_output_duplication(
 
 pub fn probe_hardware_codec_caps() -> HardwareCodecCaps {
     unsafe {
-        let _guard = ComMfGuard::new(false);
+        let _guard = ComMfGuard::new();
         HardwareCodecCaps {
             hevc_hw: has_hardware_video_encoder(MFVideoFormat_HEVC),
             av1_hw: has_hardware_video_encoder(MFVideoFormat_AV1),
@@ -2758,7 +2817,7 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
     if segments.len() == 1 {
         let seg = &segments[0];
         if let Some(ref ram) = seg.ram_data {
-            return fs::write(output_path, ram).is_ok();
+            return fs::write(output_path, ram.as_ref()).is_ok();
         }
         if let Some(p) = seg.disk_path() {
             return fs::copy(p, output_path).is_ok();
@@ -2778,7 +2837,7 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
 
         for seg in segments {
             let reader_res: Option<IMFSourceReader> = if let Some(ref ram) = seg.ram_data {
-                if let Some(stream) = SHCreateMemStream(Some(ram)) {
+                if let Some(stream) = SHCreateMemStream(Some(ram.as_ref())) {
                     if let Ok(bs) = MFCreateMFByteStreamOnStream(&stream) {
                         MFCreateSourceReaderFromByteStream(&bs, None).ok()
                     } else {
@@ -2965,7 +3024,7 @@ fn merge_segments_pure_native(segments: &[ReplaySegment], output_path: &Path, fp
 
 pub fn inspect_mp4_video_info(path: &Path) -> Option<(String, u32, u32, u32, u32)> {
     unsafe {
-        let _guard = ComMfGuard::new(false);
+        let _guard = ComMfGuard::new();
         let url = HSTRING::from(path.to_string_lossy().as_ref());
         let reader = MFCreateSourceReaderFromURL(&url, None).ok()?;
         let v_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -3270,7 +3329,7 @@ mod tests {
 
         let mut segs36 = Vec::new();
         unsafe {
-            let _com = ComMfGuard::new(false);
+            let _com = ComMfGuard::new();
             let mut dev_opt: Option<ID3D11Device> = None;
             let mut ctx_opt: Option<ID3D11DeviceContext> = None;
             let levels = [D3D_FEATURE_LEVEL_11_0];
@@ -3375,7 +3434,7 @@ mod tests {
         let _ = fs::create_dir_all(&tmp);
 
         unsafe {
-            let _com = ComMfGuard::new(false);
+            let _com = ComMfGuard::new();
             let mut dev_opt: Option<ID3D11Device> = None;
             let mut ctx_opt: Option<ID3D11DeviceContext> = None;
             let levels = [D3D_FEATURE_LEVEL_11_0];
@@ -3649,5 +3708,89 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn high_res_waitable_timer_paces_60fps_and_120fps_without_spin() {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+        let thread_cpu_ms = || -> f64 {
+            unsafe {
+                let mut create = FILETIME::default();
+                let mut exit = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+                let _ = GetThreadTimes(
+                    GetCurrentThread(),
+                    &mut create,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                );
+                let k = ((kernel.dwHighDateTime as u64) << 32) | (kernel.dwLowDateTime as u64);
+                let u = ((user.dwHighDateTime as u64) << 32) | (user.dwLowDateTime as u64);
+                (k + u) as f64 / 10_000.0
+            }
+        };
+
+        unsafe {
+            let timer = HighResWaitableTimer::new();
+            assert!(
+                timer.is_high_res(),
+                "CREATE_WAITABLE_TIMER_HIGH_RESOLUTION should succeed on Windows 10 1803+ / Windows 11"
+            );
+
+            let cpu_before = thread_cpu_ms();
+            for (fps, frames) in [(60u32, 30u64), (120u32, 60u64)] {
+                let interval_ms = 1000.0 / fps as f64;
+                let clock = Instant::now();
+                for tick in 1..=frames {
+                    let target_ms = tick as f64 * interval_ms;
+                    let now_ms = clock.elapsed().as_secs_f64() * 1000.0;
+                    if now_ms < target_ms {
+                        timer.wait_ms(target_ms - now_ms);
+                    }
+                }
+                let elapsed_ms = clock.elapsed().as_secs_f64() * 1000.0;
+                let expected_ms = frames as f64 * interval_ms;
+                assert!(
+                    (elapsed_ms - expected_ms).abs() <= 35.0,
+                    "{} FPS pacing drifted: elapsed={:.2} ms (expected {:.2} ms)",
+                    fps,
+                    elapsed_ms,
+                    expected_ms
+                );
+            }
+            let cpu_used_ms = thread_cpu_ms() - cpu_before;
+            assert!(
+                cpu_used_ms < 25.0,
+                "Waitable timer should avoid spin-loop CPU burn: used {:.2} ms CPU over 1000 ms wall time",
+                cpu_used_ms
+            );
+        }
+    }
+
+    #[test]
+    fn ram_segment_clone_shares_arc_buffer_zero_copy() {
+        let payload: Arc<[u8]> = Arc::from(vec![0x5Au8; 4 * 1024 * 1024].into_boxed_slice());
+        let seg = ReplaySegment {
+            seq_id: 42,
+            ram_data: Some(Arc::clone(&payload)),
+            disk_file: None,
+            size_bytes: payload.len() as u64,
+            duration_seconds: 5.0,
+        };
+        assert_eq!(Arc::strong_count(&payload), 2);
+        let snapshot = vec![seg.clone()];
+        assert_eq!(
+            Arc::strong_count(&payload),
+            3,
+            "Cloning ReplaySegment in RAM mode must increment Arc refcount without duplicating buffer bytes"
+        );
+        assert!(Arc::ptr_eq(
+            seg.ram_data.as_ref().unwrap(),
+            snapshot[0].ram_data.as_ref().unwrap()
+        ));
     }
 }

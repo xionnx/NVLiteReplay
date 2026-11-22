@@ -1778,9 +1778,48 @@ unsafe fn paint_tab_video(
     draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 232.0, 594.0, 34.0), &mon_label, dim_alpha);
     draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(632.0, 232.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 282.0, 300.0, 16.0), "MODE PENYIMPANAN BUFFER", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 282.0, 220.0, 16.0), "MODE PENYIMPANAN BUFFER", COL_TEXT_MUTED);
+
+    let est_max_mb = (cfg.bitrate_mbps as f64 + 0.192)
+        * (cfg.replay_duration_seconds as f64)
+        / 8.0
+        / 1.048_576;
+    let est_typ_mb = (est_max_mb * 0.60).max(1.0);
+    const RAM_BUFFER_RECOMMEND_DISK_MB: f64 = 750.0;
 
     let ram_sel = cfg.storage_mode == BufferStorageMode::RamRingBuffer;
+    let recommend_disk = ram_sel && est_max_mb >= RAM_BUFFER_RECOMMEND_DISK_MB;
+    let buf_est_hdr = if recommend_disk {
+        if est_max_mb >= 1024.0 {
+            format!("Est. RAM ~{:.2} GB · Disarankan pilih Disk Temp", est_max_mb / 1024.0)
+        } else {
+            format!("Est. RAM ~{:.0} MB · Disarankan pilih Disk Temp", est_max_mb)
+        }
+    } else {
+        let mode_lbl = if ram_sel { "RAM" } else { "Disk" };
+        if est_max_mb >= 1024.0 {
+            format!(
+                "Est. Buffer {} ~{:.1}–{:.2} GB (Peak-VBR)",
+                mode_lbl,
+                est_typ_mb / 1024.0,
+                est_max_mb / 1024.0
+            )
+        } else {
+            format!(
+                "Est. Buffer {} ~{:.0}–{:.0} MB (Peak-VBR)",
+                mode_lbl, est_typ_mb, est_max_mb
+            )
+        }
+    };
+    draw_text(
+        rt,
+        brush,
+        &d2d.fmt_right_small,
+        RectF::new(244.0, 282.0, 416.0, 16.0),
+        &buf_est_hdr,
+        if recommend_disk { COL_AMBER } else { COL_TEXT_SUB },
+    );
+
     let ram_hov = !running && drop_open.is_none() && R_STO_RAM.contains(hx, hy);
     draw_card(
         rt,
@@ -1788,7 +1827,13 @@ unsafe fn paint_tab_video(
         R_STO_RAM,
         8.0,
         if ram_sel { COL_SURFACE_ACT } else if ram_hov { COL_SURFACE_HOV } else { COL_SURFACE },
-        if ram_sel { COL_BORDER_HI } else { COL_BORDER },
+        if recommend_disk {
+            COL_AMBER
+        } else if ram_sel {
+            COL_BORDER_HI
+        } else {
+            COL_BORDER
+        },
     );
     draw_text(rt, brush, &d2d.fmt_bold, RectF::new(34.0, 312.0, 260.0, 18.0), "RAM Ring Buffer", if ram_sel { COL_TEXT } else { dim_alpha });
     draw_text(rt, brush, &d2d.fmt_small, RectF::new(34.0, 333.0, 284.0, 16.0), "0% tulis disk saat standby · Instan merge", COL_TEXT_MUTED);
@@ -1807,7 +1852,19 @@ unsafe fn paint_tab_video(
         if disk_sel { COL_BORDER_HI } else { COL_BORDER },
     );
     draw_text(rt, brush, &d2d.fmt_bold, RectF::new(360.0, 312.0, 260.0, 18.0), "Disk Temp Buffer", if disk_sel { COL_TEXT } else { dim_alpha });
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(360.0, 333.0, 284.0, 16.0), "Ultra-low RAM · Segmen disimpan di folder temp", COL_TEXT_MUTED);
+    let disk_sub = if recommend_disk {
+        "Disarankan untuk buffer > 750 MB · Ultra-low RAM"
+    } else {
+        "Ultra-low RAM · Segmen disimpan di folder temp"
+    };
+    draw_text(
+        rt,
+        brush,
+        &d2d.fmt_small,
+        RectF::new(360.0, 333.0, 284.0, 16.0),
+        disk_sub,
+        if recommend_disk { COL_AMBER } else { COL_TEXT_MUTED },
+    );
     if disk_sel {
         draw_text(rt, brush, &d2d.fmt_right_reg, RectF::new(620.0, 311.0, 28.0, 18.0), "✓", COL_EMERALD);
     }
@@ -1893,10 +1950,6 @@ unsafe fn paint_tab_video(
     draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(306.0, 534.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
 
     draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 514.0, 120.0, 16.0), "BITRATE VIDEO", COL_TEXT_MUTED);
-    let est_max_mb = (cfg.bitrate_mbps as f64 + 0.192)
-        * (cfg.replay_duration_seconds as f64)
-        / 8.0
-        / 1.048_576;
     let est_label = if est_max_mb >= 1024.0 {
         format!("Maks ~{:.2} GB", est_max_mb / 1024.0)
     } else {
@@ -1908,7 +1961,7 @@ unsafe fn paint_tab_video(
         &d2d.fmt_right_small,
         RectF::new(470.0, 514.0, 190.0, 16.0),
         &est_label,
-        if est_max_mb >= 750.0 { COL_AMBER } else { COL_TEXT_MUTED },
+        if est_max_mb >= RAM_BUFFER_RECOMMEND_DISK_MB { COL_AMBER } else { COL_TEXT_MUTED },
     );
     let br_label = BITRATE_OPTIONS
         .iter()
