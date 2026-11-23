@@ -8,7 +8,7 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20x64-09090B?style=flat-square&labelColor=18181B)
 ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20%C2%B7%20AMD%20%C2%B7%20Intel-09090B?style=flat-square&labelColor=18181B)
-![Portable](https://img.shields.io/badge/Binary-Single%20EXE%20(~875%20KB)-09090B?style=flat-square&labelColor=18181B)
+![Portable](https://img.shields.io/badge/Binary-Single%20EXE%20(~878%20KB)-09090B?style=flat-square&labelColor=18181B)
 ![License](https://img.shields.io/badge/License-MIT-09090B?style=flat-square&labelColor=18181B)
 
 Aplikasi Instant Replay ultra-ringan dalam satu file portable tanpa service background, tanpa telemetry, dan tanpa install driver tambahan. Mendukung **NVIDIA NVENC**, **AMD AMF**, maupun **Intel QSV**.
@@ -37,7 +37,7 @@ Aplikasi Instant Replay ultra-ringan dalam satu file portable tanpa service back
 | :--- | :--- |
 | **Screen Capture** | `DXGI Desktop Duplication` + komposit kursor GPU (*fallback* GDI otomatis) |
 | **Color & Scaling** | `ID3D11VideoProcessor` hardware `BGRA -> NV12` standar **BT.709** (Studio 16–235) |
-| **Hardware Encoder** | Media Foundation Hardware MFT + tuning `ICodecAPI` (**Peak-VBR terkendali**, **GOP 2 dtk**) |
+| **Hardware Encoder** | Media Foundation Hardware MFT + tuning `ICodecAPI` (pilihan **Peak-VBR** / **CBR**, **GOP 2 dtk**) |
 | **Codec Didukung** | **H.264 High Profile**, **HEVC (H.265)**, dan **AV1** *(auto-detect kemampuan GPU)* |
 | **Rolling Buffer** | Zero-copy `Arc` **RAM Ring Buffer** (0% tulis SSD saat standby) atau **Disk Temp Buffer** (custom folder) |
 | **Audio Mixing** | **WASAPI Loopback 48 kHz** (*Semua Desktop* atau **Hanya Game Aktif** tanpa Discord/Spotify via *Process Loopback*) + Mikrofon (pilihan input custom & *soft-limiter*) |
@@ -52,6 +52,7 @@ Aplikasi Instant Replay ultra-ringan dalam satu file portable tanpa service back
 
 ### 1. Pipeline Video Lintas GPU & Hemat Resource
 - **Universal Hardware Encoding**: Otomatis mendeteksi GPU **NVIDIA (NVENC)**, **AMD (AMF)**, atau **Intel (QSV)** serta kemampuan **HEVC** dan **AV1** masing-masing GPU saat startup, lengkap dengan *auto-fallback* aman.
+- **Mode Bitrate VBR & CBR**: Pilih **Peak-Constrained VBR** (hemat RAM & ukuran file saat layar tenang) atau **CBR** (bitrate konstan stabil untuk editing & streaming) langsung di tab **Video**.
 - **Akurasi Warna BT.709**: Tag metadata warna BT.709 ditulis eksplisit agar hasil klip di Discord, YouTube, dan media player tidak pucat atau meleset.
 - **High-Res Waitable Timer + MMCSS**: Pacing frame presisi tinggi (`Capture` thread priority) serta *idle-frame NV12 reuse* saat layar statis untuk menjaga penggunaan CPU & GPU serendah mungkin.
 - **Game Stretched 4:3 & Alt+Tab**: Menangani perubahan resolusi (`CopySubresourceRegion`) serta pemulihan otomatis saat *exclusive fullscreen* Alt+Tab (`DXGI_ERROR_ACCESS_LOST`).

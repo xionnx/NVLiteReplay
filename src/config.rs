@@ -53,6 +53,37 @@ impl DesktopAudioMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub enum RateControlMode {
+    Vbr = 0,
+    Cbr = 1,
+}
+
+impl RateControlMode {
+    pub fn from_i32(v: i32) -> Self {
+        if v == 1 {
+            RateControlMode::Cbr
+        } else {
+            RateControlMode::Vbr
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim();
+        if let Ok(n) = s.parse::<i32>() {
+            return Some(Self::from_i32(n));
+        }
+        if s.eq_ignore_ascii_case("cbr") {
+            Some(RateControlMode::Cbr)
+        } else if s.eq_ignore_ascii_case("vbr") || s.eq_ignore_ascii_case("peak-vbr") {
+            Some(RateControlMode::Vbr)
+        } else {
+            None
+        }
+    }
+}
+
 pub const HK_MOD_ALT: u32 = 0x0001;
 pub const HK_MOD_CONTROL: u32 = 0x0002;
 pub const HK_MOD_SHIFT: u32 = 0x0004;
@@ -293,6 +324,7 @@ pub struct ReplayConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_mbps: u32,
+    pub rate_control_mode: RateControlMode,
     pub storage_mode: BufferStorageMode,
     pub codec: VideoCodecType,
     pub hotkey_preset: HotkeyPresetType,
@@ -354,6 +386,7 @@ impl Default for ReplayConfig {
             height: 1080,
             fps: 60,
             bitrate_mbps: 12,
+            rate_control_mode: RateControlMode::Vbr,
             storage_mode: BufferStorageMode::RamRingBuffer,
             codec: VideoCodecType::HardwareH264,
             hotkey_preset: HotkeyPresetType::CtrlShiftF9F10,
@@ -512,6 +545,11 @@ impl ReplayConfig {
                         if (2..=50).contains(&n) {
                             self.bitrate_mbps = n;
                         }
+                    }
+                }
+                "RateControlMode" => {
+                    if let Some(rc) = RateControlMode::parse(val) {
+                        self.rate_control_mode = rc;
                     }
                 }
                 "StorageMode" => {
@@ -677,6 +715,7 @@ impl ReplayConfig {
              Height={}\n\
              Fps={}\n\
              BitrateMbps={}\n\
+             RateControlMode={}\n\
              StorageMode={}\n\
              Codec={}\n\
              HotkeyPreset={}\n\
@@ -710,6 +749,7 @@ impl ReplayConfig {
             self.height,
             self.fps,
             self.bitrate_mbps,
+            self.rate_control_mode as i32,
             self.storage_mode as i32,
             self.codec as i32,
             self.hotkey_preset as i32,
@@ -1398,5 +1438,26 @@ mod tests {
 
         assert!(set_run_on_startup_value(test_name, fake_exe, false));
         assert_eq!(query_run_on_startup_value(test_name), None);
+    }
+
+    #[test]
+    fn rate_control_mode_ini_roundtrip() {
+        let mut cfg = ReplayConfig::default();
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Vbr);
+
+        cfg.apply_ini_str("RateControlMode=1\n");
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Cbr);
+
+        cfg.apply_ini_str("RateControlMode=0\n");
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Vbr);
+
+        cfg.apply_ini_str("RateControlMode=CBR\n");
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Cbr);
+
+        cfg.apply_ini_str("RateControlMode=Peak-VBR\n");
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Vbr);
+
+        cfg.apply_ini_str("RateControlMode=1\nRateControlMode=99\n");
+        assert_eq!(cfg.rate_control_mode, RateControlMode::Vbr);
     }
 }

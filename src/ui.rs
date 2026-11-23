@@ -67,8 +67,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    BufferStorageMode, DesktopAudioMode, HotkeyBinding, HotkeyPresetType, VideoCodecType,
-    HK_MOD_ALT, HK_MOD_CONTROL, HK_MOD_SHIFT, HK_MOD_WIN,
+    BufferStorageMode, DesktopAudioMode, HotkeyBinding, HotkeyPresetType, RateControlMode,
+    VideoCodecType, HK_MOD_ALT, HK_MOD_CONTROL, HK_MOD_SHIFT, HK_MOD_WIN,
 };
 use crate::engine::{ReplayEngine, WM_APP_SAVED, WM_APP_STATUS, WM_APP_UPDATE, WM_APP_VOICE_TRIGGER};
 use crate::updater::{UpdateState, APP_VERSION};
@@ -277,14 +277,16 @@ const R_BTN_SAVE: RectF = RectF::new(216.0, 150.0, 188.0, 32.0);
 const R_BTN_FOLDER: RectF = RectF::new(444.0, 150.0, 216.0, 32.0);
 
 // Tab 0 geometry (Video)
-const R_CMB_MONITOR: RectF = RectF::new(20.0, 232.0, 640.0, 34.0);
-const R_STO_RAM: RectF = RectF::new(20.0, 302.0, 314.0, 60.0);
-const R_STO_DISK: RectF = RectF::new(346.0, 302.0, 314.0, 60.0);
-const R_CODEC_H264: RectF = RectF::new(346.0, 398.0, 100.0, 32.0);
-const R_CODEC_HEVC: RectF = RectF::new(453.0, 398.0, 100.0, 32.0);
-const R_CODEC_AV1: RectF = RectF::new(560.0, 398.0, 100.0, 32.0);
-const R_CMB_RES: RectF = RectF::new(20.0, 534.0, 314.0, 34.0);
-const R_CMB_BITRATE: RectF = RectF::new(346.0, 534.0, 314.0, 34.0);
+const R_CMB_MONITOR: RectF = RectF::new(20.0, 226.0, 640.0, 32.0);
+const R_STO_RAM: RectF = RectF::new(20.0, 288.0, 314.0, 54.0);
+const R_STO_DISK: RectF = RectF::new(346.0, 288.0, 314.0, 54.0);
+const R_CODEC_H264: RectF = RectF::new(346.0, 372.0, 100.0, 30.0);
+const R_CODEC_HEVC: RectF = RectF::new(453.0, 372.0, 100.0, 30.0);
+const R_CODEC_AV1: RectF = RectF::new(560.0, 372.0, 100.0, 30.0);
+const R_CMB_RES: RectF = RectF::new(20.0, 492.0, 314.0, 32.0);
+const R_CMB_BITRATE: RectF = RectF::new(346.0, 492.0, 314.0, 32.0);
+const R_RC_VBR: RectF = RectF::new(20.0, 554.0, 314.0, 32.0);
+const R_RC_CBR: RectF = RectF::new(346.0, 554.0, 314.0, 32.0);
 
 // Tab 1 geometry (Audio)
 const R_TOG_DESKTOP: RectF = RectF::new(600.0, 227.0, 42.0, 22.0);
@@ -1349,14 +1351,14 @@ fn duration_pill_rect(idx: usize) -> RectF {
     let w = 101.6;
     let gap = 6.08;
     let x = 20.0 + (idx as f32) * (w + gap);
-    RectF::new(x, 466.0, w, 32.0)
+    RectF::new(x, 432.0, w, 30.0)
 }
 
 fn fps_pill_rect(idx: usize) -> RectF {
     let w = 100.6;
     let gap = 6.1;
     let x = 20.0 + (idx as f32) * (w + gap);
-    RectF::new(x, 398.0, w, 32.0)
+    RectF::new(x, 372.0, w, 30.0)
 }
 
 fn truncate_tail(text: &str, max_chars: usize) -> String {
@@ -1756,13 +1758,17 @@ unsafe fn paint_ui_to_hdc(state: &mut UiState, target_hdc: HDC) {
         VideoCodecType::HardwareHEVC => "HEVC",
         VideoCodecType::HardwareH264 => "H.264",
     };
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(444.0, 127.0, 96.0, 16.0), "Encoder", COL_TEXT_SUB);
+    let rc_short = match cfg.rate_control_mode {
+        RateControlMode::Cbr => "CBR",
+        RateControlMode::Vbr => "VBR",
+    };
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(444.0, 127.0, 68.0, 16.0), "Encoder", COL_TEXT_SUB);
     draw_text(
         rt,
         brush,
         &d2d.fmt_right_small,
-        RectF::new(530.0, 127.0, 130.0, 16.0),
-        &format!("{} · {}", codec_short, enc_vendor),
+        RectF::new(512.0, 127.0, 148.0, 16.0),
+        &format!("{} {} · {}", codec_short, rc_short, enc_vendor),
         COL_TEXT_SUB,
     );
 
@@ -1861,9 +1867,9 @@ unsafe fn paint_tab_video(
 ) {
     let dim_alpha = if running { COL_TEXT_DIM } else { COL_TEXT };
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 212.0, 360.0, 16.0), "MONITOR TARGET", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 208.0, 360.0, 16.0), "MONITOR TARGET", COL_TEXT_MUTED);
     if running {
-        draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 212.0, 260.0, 16.0), "Terkunci saat merekam", COL_AMBER);
+        draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(400.0, 208.0, 260.0, 16.0), "Terkunci saat merekam", COL_AMBER);
     }
     let mon_label = displays
         .get(cfg.monitor_index)
@@ -1880,10 +1886,10 @@ unsafe fn paint_tab_video(
         if mon_hov || mon_open { COL_SURFACE_HOV } else { COL_SURFACE },
         if mon_hov || mon_open { COL_BORDER_HI } else { COL_BORDER },
     );
-    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 232.0, 594.0, 34.0), &mon_label, dim_alpha);
-    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(632.0, 232.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 226.0, 594.0, 32.0), &mon_label, dim_alpha);
+    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(632.0, 226.0, 24.0, 32.0), "▾", COL_TEXT_MUTED);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 282.0, 220.0, 16.0), "MODE PENYIMPANAN BUFFER", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 270.0, 220.0, 16.0), "MODE PENYIMPANAN BUFFER", COL_TEXT_MUTED);
 
     let est_max_mb = (cfg.bitrate_mbps as f64 + 0.192)
         * (cfg.replay_duration_seconds as f64)
@@ -1892,6 +1898,7 @@ unsafe fn paint_tab_video(
     let est_typ_mb = (est_max_mb * 0.60).max(1.0);
     const RAM_BUFFER_RECOMMEND_DISK_MB: f64 = 750.0;
 
+    let rc_mode = cfg.rate_control_mode;
     let ram_sel = cfg.storage_mode == BufferStorageMode::RamRingBuffer;
     let recommend_disk = ram_sel && est_max_mb >= RAM_BUFFER_RECOMMEND_DISK_MB;
     let buf_est_hdr = if recommend_disk {
@@ -1902,25 +1909,36 @@ unsafe fn paint_tab_video(
         }
     } else {
         let mode_lbl = if ram_sel { "RAM" } else { "Disk" };
-        if est_max_mb >= 1024.0 {
-            format!(
-                "Est. Buffer {} ~{:.1}–{:.2} GB (Peak-VBR)",
-                mode_lbl,
-                est_typ_mb / 1024.0,
-                est_max_mb / 1024.0
-            )
-        } else {
-            format!(
-                "Est. Buffer {} ~{:.0}–{:.0} MB (Peak-VBR)",
-                mode_lbl, est_typ_mb, est_max_mb
-            )
+        match rc_mode {
+            RateControlMode::Cbr => {
+                if est_max_mb >= 1024.0 {
+                    format!("Est. Buffer {} ~{:.2} GB (CBR)", mode_lbl, est_max_mb / 1024.0)
+                } else {
+                    format!("Est. Buffer {} ~{:.0} MB (CBR)", mode_lbl, est_max_mb)
+                }
+            }
+            RateControlMode::Vbr => {
+                if est_max_mb >= 1024.0 {
+                    format!(
+                        "Est. Buffer {} ~{:.1}–{:.2} GB (Peak-VBR)",
+                        mode_lbl,
+                        est_typ_mb / 1024.0,
+                        est_max_mb / 1024.0
+                    )
+                } else {
+                    format!(
+                        "Est. Buffer {} ~{:.0}–{:.0} MB (Peak-VBR)",
+                        mode_lbl, est_typ_mb, est_max_mb
+                    )
+                }
+            }
         }
     };
     draw_text(
         rt,
         brush,
         &d2d.fmt_right_small,
-        RectF::new(244.0, 282.0, 416.0, 16.0),
+        RectF::new(244.0, 270.0, 416.0, 16.0),
         &buf_est_hdr,
         if recommend_disk { COL_AMBER } else { COL_TEXT_SUB },
     );
@@ -1940,10 +1958,10 @@ unsafe fn paint_tab_video(
             COL_BORDER
         },
     );
-    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(34.0, 312.0, 260.0, 18.0), "RAM Ring Buffer", if ram_sel { COL_TEXT } else { dim_alpha });
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(34.0, 333.0, 284.0, 16.0), "0% tulis disk saat standby · Instan merge", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(34.0, 296.0, 260.0, 18.0), "RAM Ring Buffer", if ram_sel { COL_TEXT } else { dim_alpha });
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(34.0, 316.0, 284.0, 16.0), "0% tulis disk saat standby · Instan merge", COL_TEXT_MUTED);
     if ram_sel {
-        draw_text(rt, brush, &d2d.fmt_right_reg, RectF::new(294.0, 311.0, 28.0, 18.0), "✓", COL_EMERALD);
+        draw_text(rt, brush, &d2d.fmt_right_reg, RectF::new(294.0, 296.0, 28.0, 18.0), "✓", COL_EMERALD);
     }
 
     let disk_sel = cfg.storage_mode == BufferStorageMode::DiskTempBuffer;
@@ -1956,7 +1974,7 @@ unsafe fn paint_tab_video(
         if disk_sel { COL_SURFACE_ACT } else if disk_hov { COL_SURFACE_HOV } else { COL_SURFACE },
         if disk_sel { COL_BORDER_HI } else { COL_BORDER },
     );
-    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(360.0, 312.0, 260.0, 18.0), "Disk Temp Buffer", if disk_sel { COL_TEXT } else { dim_alpha });
+    draw_text(rt, brush, &d2d.fmt_bold, RectF::new(360.0, 296.0, 260.0, 18.0), "Disk Temp Buffer", if disk_sel { COL_TEXT } else { dim_alpha });
     let disk_sub = if recommend_disk {
         "Disarankan untuk buffer > 750 MB · Ultra-low RAM"
     } else {
@@ -1966,15 +1984,15 @@ unsafe fn paint_tab_video(
         rt,
         brush,
         &d2d.fmt_small,
-        RectF::new(360.0, 333.0, 284.0, 16.0),
+        RectF::new(360.0, 316.0, 284.0, 16.0),
         disk_sub,
         if recommend_disk { COL_AMBER } else { COL_TEXT_MUTED },
     );
     if disk_sel {
-        draw_text(rt, brush, &d2d.fmt_right_reg, RectF::new(620.0, 311.0, 28.0, 18.0), "✓", COL_EMERALD);
+        draw_text(rt, brush, &d2d.fmt_right_reg, RectF::new(620.0, 296.0, 28.0, 18.0), "✓", COL_EMERALD);
     }
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 378.0, 200.0, 16.0), "FRAMERATE", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 354.0, 200.0, 16.0), "FRAMERATE", COL_TEXT_MUTED);
     for (i, &(fps_val, label)) in FPS_OPTIONS.iter().enumerate() {
         let r = fps_pill_rect(i);
         let active = cfg.fps == fps_val;
@@ -1989,7 +2007,7 @@ unsafe fn paint_tab_video(
         .map(|d| d.vendor_tag.as_str())
         .unwrap_or("GPU");
     let enc_hdr = format!("ENCODER HARDWARE ({})", enc_vendor);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 378.0, 314.0, 16.0), &enc_hdr, COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 354.0, 314.0, 16.0), &enc_hdr, COL_TEXT_MUTED);
 
     let h264_act = cfg.codec == VideoCodecType::HardwareH264;
     let h264_hov = !running && drop_open.is_none() && R_CODEC_H264.contains(hx, hy);
@@ -2022,7 +2040,7 @@ unsafe fn paint_tab_video(
         if av1_act { COL_TEXT } else if !av1_avail || running { COL_TEXT_DIM } else { COL_TEXT_SUB },
     );
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 446.0, 300.0, 16.0), "DURASI REPLAY", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 414.0, 300.0, 16.0), "DURASI REPLAY", COL_TEXT_MUTED);
     for (i, &(dur_s, label)) in DURATIONS.iter().enumerate() {
         let r = duration_pill_rect(i);
         let active = cfg.replay_duration_seconds == dur_s;
@@ -2031,7 +2049,7 @@ unsafe fn paint_tab_video(
         draw_text(rt, brush, if active { &d2d.fmt_center_bold } else { &d2d.fmt_center_reg }, r, label, if active { COL_TEXT } else if running { COL_TEXT_DIM } else { COL_TEXT_SUB });
     }
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 514.0, 260.0, 16.0), "RESOLUSI VIDEO", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 474.0, 260.0, 16.0), "RESOLUSI VIDEO", COL_TEXT_MUTED);
     let res_label = if cfg.use_native_resolution {
         RESOLUTIONS[0].label
     } else {
@@ -2051,20 +2069,31 @@ unsafe fn paint_tab_video(
         if res_hov || res_open { COL_SURFACE_HOV } else { COL_SURFACE },
         if res_hov || res_open { COL_BORDER_HI } else { COL_BORDER },
     );
-    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 534.0, 268.0, 34.0), res_label, dim_alpha);
-    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(306.0, 534.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(32.0, 492.0, 268.0, 32.0), res_label, dim_alpha);
+    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(306.0, 492.0, 24.0, 32.0), "▾", COL_TEXT_MUTED);
 
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 514.0, 120.0, 16.0), "BITRATE VIDEO", COL_TEXT_MUTED);
-    let est_label = if est_max_mb >= 1024.0 {
-        format!("Maks ~{:.2} GB", est_max_mb / 1024.0)
-    } else {
-        format!("Maks ~{:.0} MB", est_max_mb)
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(346.0, 474.0, 120.0, 16.0), "BITRATE VIDEO", COL_TEXT_MUTED);
+    let est_label = match rc_mode {
+        RateControlMode::Cbr => {
+            if est_max_mb >= 1024.0 {
+                format!("Tetap ~{:.2} GB", est_max_mb / 1024.0)
+            } else {
+                format!("Tetap ~{:.0} MB", est_max_mb)
+            }
+        }
+        RateControlMode::Vbr => {
+            if est_max_mb >= 1024.0 {
+                format!("Maks ~{:.2} GB", est_max_mb / 1024.0)
+            } else {
+                format!("Maks ~{:.0} MB", est_max_mb)
+            }
+        }
     };
     draw_text(
         rt,
         brush,
         &d2d.fmt_right_small,
-        RectF::new(470.0, 514.0, 190.0, 16.0),
+        RectF::new(470.0, 474.0, 190.0, 16.0),
         &est_label,
         if est_max_mb >= RAM_BUFFER_RECOMMEND_DISK_MB { COL_AMBER } else { COL_TEXT_MUTED },
     );
@@ -2083,18 +2112,52 @@ unsafe fn paint_tab_video(
         if br_hov || br_open { COL_SURFACE_HOV } else { COL_SURFACE },
         if br_hov || br_open { COL_BORDER_HI } else { COL_BORDER },
     );
-    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(358.0, 534.0, 268.0, 34.0), br_label, dim_alpha);
-    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(632.0, 534.0, 24.0, 34.0), "▾", COL_TEXT_MUTED);
+    draw_text(rt, brush, &d2d.fmt_reg, RectF::new(358.0, 492.0, 268.0, 32.0), br_label, dim_alpha);
+    draw_text(rt, brush, &d2d.fmt_center_small, RectF::new(632.0, 492.0, 24.0, 32.0), "▾", COL_TEXT_MUTED);
 
-    // Subtle bottom pipeline spec line (like reference catalog rows)
-    draw_hline(rt, brush, 20.0, 660.0, 588.0, COL_DIVIDER);
-    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 602.0, 170.0, 18.0), "PIPELINE WARNA & VBR", COL_TEXT_MUTED);
+    // Rate Control Mode Selector (VBR vs CBR)
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 536.0, 150.0, 16.0), "MODE BITRATE", COL_TEXT_MUTED);
+    let rc_hint = match rc_mode {
+        RateControlMode::Vbr => "Hemat RAM & file saat layar tenang · Puncak sesuai bitrate",
+        RateControlMode::Cbr => "Bitrate konstan stabil setiap detik · Ideal editing & streaming",
+    };
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(176.0, 536.0, 484.0, 16.0), rc_hint, COL_TEXT_MUTED);
+
+    let vbr_act = rc_mode == RateControlMode::Vbr;
+    let vbr_hov = !running && drop_open.is_none() && R_RC_VBR.contains(hx, hy);
+    draw_chip(rt, brush, R_RC_VBR, 6.0, vbr_act, vbr_hov, running);
+    draw_text(
+        rt,
+        brush,
+        if vbr_act { &d2d.fmt_center_bold } else { &d2d.fmt_center_reg },
+        R_RC_VBR,
+        "VBR · Peak-Constrained (Hemat Ukuran)",
+        if vbr_act { COL_TEXT } else if running { COL_TEXT_DIM } else { COL_TEXT_SUB },
+    );
+
+    let cbr_act = rc_mode == RateControlMode::Cbr;
+    let cbr_hov = !running && drop_open.is_none() && R_RC_CBR.contains(hx, hy);
+    draw_chip(rt, brush, R_RC_CBR, 6.0, cbr_act, cbr_hov, running);
+    draw_text(
+        rt,
+        brush,
+        if cbr_act { &d2d.fmt_center_bold } else { &d2d.fmt_center_reg },
+        R_RC_CBR,
+        "CBR · Constant Bitrate (Stabil)",
+        if cbr_act { COL_TEXT } else if running { COL_TEXT_DIM } else { COL_TEXT_SUB },
+    );
+
+    // Subtle bottom pipeline spec line
+    draw_hline(rt, brush, 20.0, 660.0, 600.0, COL_DIVIDER);
+    draw_text(rt, brush, &d2d.fmt_small, RectF::new(20.0, 612.0, 150.0, 18.0), "PIPELINE VIDEO", COL_TEXT_MUTED);
     let pipe_desc = if running && pipe_status != "Standby" {
         pipe_status.to_string()
+    } else if rc_mode == RateControlMode::Cbr {
+        "NV12 GPU BT.709 · CBR · GOP 2 dtk".to_string()
     } else {
         "NV12 GPU BT.709 · Peak-VBR · GOP 2 dtk".to_string()
     };
-    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(196.0, 602.0, 464.0, 18.0), &pipe_desc, COL_TEXT_SUB);
+    draw_text(rt, brush, &d2d.fmt_right_small, RectF::new(176.0, 612.0, 484.0, 18.0), &pipe_desc, COL_TEXT_SUB);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3164,6 +3227,8 @@ fn hover_cursor_kind(state: &UiState, x: f32, y: f32) -> HoverCursorKind {
                     || (caps.av1_hw && R_CODEC_AV1.contains(x, y))
                     || R_CMB_RES.contains(x, y)
                     || R_CMB_BITRATE.contains(x, y)
+                    || R_RC_VBR.contains(x, y)
+                    || R_RC_CBR.contains(x, y)
                     || (0..FPS_OPTIONS.len()).any(|i| fps_pill_rect(i).contains(x, y))
                     || (0..DURATIONS.len()).any(|i| duration_pill_rect(i).contains(x, y)))
             {
@@ -3424,6 +3489,14 @@ unsafe fn handle_click(state: &mut UiState, x: f32, y: f32) {
             } else if R_STO_DISK.contains(x, y) {
                 let mut cfg = state.engine.config.lock().unwrap();
                 cfg.storage_mode = BufferStorageMode::DiskTempBuffer;
+                cfg.save();
+            } else if R_RC_VBR.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                cfg.rate_control_mode = RateControlMode::Vbr;
+                cfg.save();
+            } else if R_RC_CBR.contains(x, y) {
+                let mut cfg = state.engine.config.lock().unwrap();
+                cfg.rate_control_mode = RateControlMode::Cbr;
                 cfg.save();
             } else if R_CODEC_H264.contains(x, y) {
                 let mut cfg = state.engine.config.lock().unwrap();
