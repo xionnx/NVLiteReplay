@@ -18,6 +18,9 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
 };
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
@@ -322,7 +325,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     unsafe {
-        let _ = SetProcessDPIAware();
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
+            let _ = SetProcessDPIAware();
+        }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,

@@ -9,8 +9,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR, VARIANT};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, RECT, STILL_ACTIVE, WPARAM,
+    CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, POINT, RECT, STILL_ACTIVE, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -32,14 +37,15 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutput5, IDXGIOutputDuplication, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors,
-    EnumDisplaySettingsW, GetDC, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DEVMODEW, DIB_RGB_COLORS, ENUM_CURRENT_SETTINGS, HBITMAP, HDC,
-    HGDIOBJ, HMONITOR, MONITORINFOEXW, SRCCOPY,
+    EnumDisplaySettingsW, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SelectObject,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEVMODEW, DIB_RGB_COLORS, ENUM_CURRENT_SETTINGS,
+    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
@@ -69,8 +75,8 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, IStream, COINIT_MULTITHREADED, STATFLAG_NONAME,
-    STATSTG, STREAM_SEEK_SET,
+    CoIncrementMTAUsage, CoInitializeEx, CoTaskMemFree, CoUninitialize, IStream,
+    COINIT_MULTITHREADED, STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET,
 };
 use windows::Win32::System::Diagnostics::Debug::Beep;
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
@@ -80,6 +86,16 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, SetWaitableTimer, WaitForSingleObject,
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::{
+    RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED,
+};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -107,7 +123,6 @@ pub struct DisplayTarget {
     pub index: usize,
     pub adapter_index: u32,
     pub output_index: u32,
-    #[allow(dead_code)]
     pub device_name: String,
     pub adapter_name: String,
     pub vendor_tag: String,
@@ -186,16 +201,38 @@ impl ReplaySegment {
     }
 }
 
+fn ensure_process_mta_pinned() {
+    static MTA_PIN: std::sync::Once = std::sync::Once::new();
+    MTA_PIN.call_once(|| unsafe {
+        // Keep the process COM/WinRT MTA alive across capture stop/start cycles so
+        // windows-rs global FactoryCache agile activation factories never dangle when
+        // worker threads exit and call RoUninitialize/CoUninitialize.
+        let _ = CoIncrementMTAUsage();
+    });
+}
+
 struct ComMfGuard {
+    ro_owned: bool,
     com_owned: bool,
 }
 
 impl ComMfGuard {
     unsafe fn new() -> Self {
-        // RPC_E_CHANGED_MODE on an STA thread (UI) must not be paired with CoUninitialize.
-        let com_owned = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        ensure_process_mta_pinned();
+        // Prefer RoInitialize(RO_INIT_MULTITHREADED), which initializes both WinRT and COM MTA
+        // once for the lifetime of the worker thread (avoiding mid-session RoUninitialize races).
+        // RPC_E_CHANGED_MODE on an STA thread must not be paired with uninit.
+        let ro_owned = RoInitialize(RO_INIT_MULTITHREADED).is_ok();
+        let com_owned = if ro_owned {
+            false
+        } else {
+            CoInitializeEx(None, COINIT_MULTITHREADED).is_ok()
+        };
         let _ = MFStartup(MF_VERSION, 0);
-        Self { com_owned }
+        Self {
+            ro_owned,
+            com_owned,
+        }
     }
 }
 
@@ -203,7 +240,9 @@ impl Drop for ComMfGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = MFShutdown();
-            if self.com_owned {
+            if self.ro_owned {
+                RoUninitialize();
+            } else if self.com_owned {
                 CoUninitialize();
             }
         }
@@ -1391,6 +1430,8 @@ impl ReplayEngine {
         let frames_per_segment = cfg_init.segment_duration_seconds * fps;
 
         unsafe {
+            set_capture_thread_dpi_aware();
+
             let mut target_adapter: Option<IDXGIAdapter1> = None;
             if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
                 target_adapter = factory.EnumAdapters1(target_mon.adapter_index).ok();
@@ -1446,9 +1487,26 @@ impl ReplayEngine {
                 let _ = mgr.ResetDevice(&device, reset_token);
             }
 
-            let mut desk_dupl =
-                try_create_output_duplication(&target_adapter, target_mon.output_index, &device);
-            let dupl_supported = desk_dupl.is_some();
+            // Tier 1: DXGI Desktop Duplication (Output5 DuplicateOutput1 -> Output1 DuplicateOutput)
+            // with short startup retry window so pressing toggle mid-fullscreen/UAC never permanently
+            // traps the session in GDI BitBlt (which sees through Flip-Model/MPO games like Valorant).
+            let mut desk_dupl = try_create_output_duplication_with_retry(
+                &device,
+                &target_mon.device_name,
+                target_mon.output_index,
+                3,
+                60,
+            );
+            // Tier 2: Windows.Graphics.Capture GPU monitor capture if DXGI is unavailable at startup.
+            let mut wgc_cap: Option<WgcMonitorCapture> = if desk_dupl.is_none() {
+                WgcMonitorCapture::new(&device, target_mon)
+            } else {
+                None
+            };
+            let mut wgc_has_frame = false;
+            let mut wgc_started_at = Instant::now();
+            let mut wgc_disabled_for_session = false;
+            let mut dupl_lost_since: Option<Instant> = None;
 
             let tex_desc = D3D11_TEXTURE2D_DESC {
                 Width: cap_width,
@@ -1468,6 +1526,29 @@ impl ReplayEngine {
 
             let mut staging_tex: Option<ID3D11Texture2D> = None;
             let _ = device.CreateTexture2D(&tex_desc, None, Some(&mut staging_tex));
+            let mut staging_w = cap_width;
+            let mut staging_h = cap_height;
+            let mut need_ring_clear = false;
+
+            if let Some(ref mut wgc) = wgc_cap {
+                for _ in 0..12 {
+                    if wgc.acquire_latest_frame(
+                        &device,
+                        &context,
+                        &mut staging_tex,
+                        &mut staging_w,
+                        &mut staging_h,
+                        &tex_desc,
+                        cap_width,
+                        cap_height,
+                        &mut need_ring_clear,
+                    ) {
+                        wgc_has_frame = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(15));
+                }
+            }
 
             let safe_out_w = (out_width & !1).max(640);
             let safe_out_h = (out_height & !1).max(360);
@@ -1684,18 +1765,24 @@ impl ReplayEngine {
                 VideoCodecType::HardwareHEVC => "HEVC",
                 VideoCodecType::HardwareH264 => "H.264 High",
             };
-            if let Ok(mut s) = engine.capture_mode_status.lock() {
-                *s = format!(
-                    "{}{}{}",
-                    if desk_dupl.is_some() {
-                        "DXGI "
-                    } else {
-                        "D3D11 "
-                    },
-                    if use_nv12 { "NV12 + " } else { "Direct + " },
-                    target_mon.vendor_tag
-                );
-            }
+            let set_cap_status = |tag: &str| {
+                if let Ok(mut s) = engine.capture_mode_status.lock() {
+                    *s = format!(
+                        "{}{}{}",
+                        tag,
+                        if use_nv12 { " NV12 + " } else { " Direct + " },
+                        target_mon.vendor_tag
+                    );
+                }
+                engine.notify_ui_status();
+            };
+            set_cap_status(if desk_dupl.is_some() {
+                "DXGI"
+            } else if wgc_cap.is_some() {
+                "WGC GPU"
+            } else {
+                "GDI Fallback"
+            });
             let rc_label = if rc_tuned {
                 match rate_control {
                     RateControlMode::Cbr => "CBR+GOP",
@@ -1714,10 +1801,7 @@ impl ReplayEngine {
             }
 
             let mut gdi_state = GdiFallbackState::default();
-            let mut staging_w = cap_width;
-            let mut staging_h = cap_height;
             let mut need_size_check = true;
-            let mut need_ring_clear = false;
             let mut last_dupl_retry = Instant::now();
             let mut last_valid_ring_slot: Option<usize> = None;
             let mut render_seq: usize = 0;
@@ -1804,24 +1888,79 @@ impl ReplayEngine {
                     }
                 }
 
-                // 1. Capture desktop frame
-                let mut captured_via_dupl = false;
-                let mut dupl_screen_updated = false;
+                // 1. Capture desktop/game frame (3-tier self-healing GPU pipeline: DXGI -> WGC -> GDI)
+                let mut captured_via_gpu = false;
+                let mut composite_dxgi_cursor = false;
+                let mut gpu_screen_updated = false;
                 let mut dupl_mouse_updated = false;
-                if desk_dupl.is_none() && dupl_supported {
-                    captured_via_dupl = true;
-                    if last_dupl_retry.elapsed() >= Duration::from_millis(250) {
+
+                if desk_dupl.is_none() && wgc_cap.is_none() {
+                    if let Some(lost_at) = dupl_lost_since {
+                        // Brief DXGI recovery window after ACCESS_LOST (fullscreen/Alt-Tab/UAC).
+                        // Hold last GPU frame during transition so GDI never flashes Desktop behind game.
+                        captured_via_gpu = true;
+                        composite_dxgi_cursor = true;
+                        if last_dupl_retry.elapsed() >= Duration::from_millis(250) {
+                            last_dupl_retry = Instant::now();
+                            desk_dupl = try_create_output_duplication(
+                                &device,
+                                &target_mon.device_name,
+                                target_mon.output_index,
+                            );
+                            if desk_dupl.is_some() {
+                                dupl_lost_since = None;
+                                need_size_check = true;
+                                last_valid_ring_slot = None;
+                                if let Some(ref mut comp) = cursor_comp {
+                                    comp.on_duplication_reset();
+                                }
+                                set_cap_status("DXGI");
+                            } else if lost_at.elapsed() >= Duration::from_millis(1500) {
+                                if device.GetDeviceRemovedReason().is_err() {
+                                    outcome = CaptureSessionOutcome::NeedsRestart;
+                                    break;
+                                }
+                                dupl_lost_since = None;
+                                if !wgc_disabled_for_session {
+                                    if let Some(wgc) = WgcMonitorCapture::new(&device, target_mon) {
+                                        wgc_cap = Some(wgc);
+                                        wgc_has_frame = false;
+                                        wgc_started_at = Instant::now();
+                                        last_valid_ring_slot = None;
+                                        set_cap_status("WGC GPU");
+                                    } else {
+                                        captured_via_gpu = false;
+                                        set_cap_status("GDI Fallback");
+                                    }
+                                } else {
+                                    captured_via_gpu = false;
+                                    set_cap_status("GDI Fallback");
+                                }
+                            }
+                        }
+                    } else if last_dupl_retry.elapsed() >= Duration::from_secs(1) {
+                        // Never stay permanently trapped in GDI BitBlt: periodically upgrade back to
+                        // DXGI (or WGC GPU if not already disabled) as soon as desktop allows it.
                         last_dupl_retry = Instant::now();
                         desk_dupl = try_create_output_duplication(
-                            &target_adapter,
-                            target_mon.output_index,
                             &device,
+                            &target_mon.device_name,
+                            target_mon.output_index,
                         );
                         if desk_dupl.is_some() {
                             need_size_check = true;
                             last_valid_ring_slot = None;
                             if let Some(ref mut comp) = cursor_comp {
                                 comp.on_duplication_reset();
+                            }
+                            set_cap_status("DXGI");
+                        } else if !wgc_disabled_for_session {
+                            if let Some(wgc) = WgcMonitorCapture::new(&device, target_mon) {
+                                wgc_cap = Some(wgc);
+                                wgc_has_frame = false;
+                                wgc_started_at = Instant::now();
+                                last_valid_ring_slot = None;
+                                set_cap_status("WGC GPU");
                             }
                         }
                     }
@@ -1868,38 +2007,70 @@ impl ReplayEngine {
                                         }
                                         if let Some(ref stex) = staging_tex {
                                             context.CopyResource(stex, &dupl_tex);
-                                            dupl_screen_updated = true;
+                                            gpu_screen_updated = true;
                                         }
                                     }
                                 }
                             }
                             let _ = dupl.ReleaseFrame();
-                            if dupl_screen_updated || dupl_mouse_updated {
+                            if gpu_screen_updated || dupl_mouse_updated {
                                 context.Flush();
                             }
-                            captured_via_dupl = true;
+                            captured_via_gpu = true;
+                            composite_dxgi_cursor = true;
                         }
                         Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                            captured_via_dupl = true;
+                            captured_via_gpu = true;
+                            composite_dxgi_cursor = true;
                         }
                         Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST || e.code().is_err() => {
                             drop(desk_dupl.take());
                             last_dupl_retry = Instant::now();
                             desk_dupl = try_create_output_duplication(
-                                &target_adapter,
-                                target_mon.output_index,
                                 &device,
+                                &target_mon.device_name,
+                                target_mon.output_index,
                             );
                             if desk_dupl.is_some() {
+                                dupl_lost_since = None;
                                 need_size_check = true;
                                 last_valid_ring_slot = None;
                                 if let Some(ref mut comp) = cursor_comp {
                                     comp.on_duplication_reset();
                                 }
+                            } else {
+                                dupl_lost_since = Some(Instant::now());
                             }
-                            captured_via_dupl = true;
+                            captured_via_gpu = true;
+                            composite_dxgi_cursor = true;
                         }
                         Err(_) => {}
+                    }
+                } else if let Some(ref mut wgc) = wgc_cap {
+                    if wgc.acquire_latest_frame(
+                        &device,
+                        &context,
+                        &mut staging_tex,
+                        &mut staging_w,
+                        &mut staging_h,
+                        &tex_desc,
+                        cap_width,
+                        cap_height,
+                        &mut need_ring_clear,
+                    ) {
+                        gpu_screen_updated = true;
+                        wgc_has_frame = true;
+                    }
+                    if wgc_has_frame {
+                        captured_via_gpu = true;
+                        composite_dxgi_cursor = false;
+                    } else if wgc_started_at.elapsed() >= Duration::from_millis(1500) {
+                        // Isolated/headless desktop where WGC never produces frames: release WGC
+                        // once for this session and fall back to GDI while continuing DXGI retries.
+                        drop(wgc_cap.take());
+                        wgc_disabled_for_session = true;
+                        last_dupl_retry = Instant::now();
+                        set_cap_status("GDI Fallback");
                     }
                 }
 
@@ -1907,10 +2078,10 @@ impl ReplayEngine {
                 // changed (`LastPresentTime == 0 && LastMouseUpdateTime == 0`).
                 // Encoder still receives a sample every tick (preserving CFR), while GPU skips
                 // CopyResource, cursor composite shader, and VideoProcessorBlt BGRA -> NV12.
-                let need_render_and_convert = !captured_via_dupl
+                let need_render_and_convert = !captured_via_gpu
                     || last_valid_ring_slot.is_none()
                     || need_ring_clear
-                    || dupl_screen_updated
+                    || gpu_screen_updated
                     || dupl_mouse_updated;
 
                 let ring_slot = if need_render_and_convert {
@@ -1925,7 +2096,7 @@ impl ReplayEngine {
                         (&gpu_tex_ring[slot], &gpu_rtv_ring[slot])
                     };
 
-                    if captured_via_dupl {
+                    if captured_via_gpu {
                         if need_ring_clear {
                             need_ring_clear = false;
                             let clear_black = [0.0f32, 0.0, 0.0, 1.0];
@@ -1990,7 +2161,7 @@ impl ReplayEngine {
                                 );
                             }
                         }
-                        if copied_frame {
+                        if copied_frame && composite_dxgi_cursor {
                             if let Some(ref mut comp) = cursor_comp {
                                 comp.composite_onto_target(
                                     &device,
@@ -2401,6 +2572,8 @@ impl ReplayEngine {
             for h in finalizer_handles.drain(..) {
                 let _ = h.join();
             }
+            drop(wgc_cap.take());
+            drop(desk_dupl.take());
             outcome
         }
     }
@@ -2489,15 +2662,240 @@ unsafe fn enum_monitors_gdi(gpu_name: &str) -> Vec<DisplayTarget> {
     ctx.items
 }
 
-unsafe fn try_create_output_duplication(
-    adapter: &Option<IDXGIAdapter1>,
-    output_idx: u32,
+unsafe fn set_capture_thread_dpi_aware() {
+    let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+}
+
+unsafe fn find_matching_dxgi_output(
     device: &ID3D11Device,
+    target_device_name: &str,
+    fallback_output_idx: u32,
+) -> Option<IDXGIOutput> {
+    let dxgi_dev: IDXGIDevice = device.cast().ok()?;
+    let adap = dxgi_dev.GetAdapter().ok()?;
+    if !target_device_name.is_empty() {
+        let mut idx = 0u32;
+        while let Ok(output) = adap.EnumOutputs(idx) {
+            if let Ok(desc) = output.GetDesc() {
+                if utf16_slice_to_string(&desc.DeviceName).eq_ignore_ascii_case(target_device_name)
+                {
+                    return Some(output);
+                }
+            }
+            idx += 1;
+        }
+    }
+    adap.EnumOutputs(fallback_output_idx).ok()
+}
+
+unsafe fn try_create_output_duplication(
+    device: &ID3D11Device,
+    target_device_name: &str,
+    fallback_output_idx: u32,
 ) -> Option<IDXGIOutputDuplication> {
-    let adap = adapter.as_ref()?;
-    let output = adap.EnumOutputs(output_idx).ok()?;
+    let output = find_matching_dxgi_output(device, target_device_name, fallback_output_idx)?;
+    if let Ok(out5) = output.cast::<IDXGIOutput5>() {
+        let formats = [DXGI_FORMAT_B8G8R8A8_UNORM];
+        if let Ok(dupl) = out5.DuplicateOutput1(device, 0, &formats) {
+            return Some(dupl);
+        }
+    }
     let out1: IDXGIOutput1 = output.cast().ok()?;
     out1.DuplicateOutput(device).ok()
+}
+
+unsafe fn try_create_output_duplication_with_retry(
+    device: &ID3D11Device,
+    target_device_name: &str,
+    fallback_output_idx: u32,
+    attempts: u32,
+    delay_ms: u64,
+) -> Option<IDXGIOutputDuplication> {
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        if let Some(dupl) =
+            try_create_output_duplication(device, target_device_name, fallback_output_idx)
+        {
+            return Some(dupl);
+        }
+    }
+    None
+}
+
+unsafe fn resolve_target_hmonitor(
+    device: &ID3D11Device,
+    target_mon: &DisplayTarget,
+) -> Option<HMONITOR> {
+    if let Some(output) =
+        find_matching_dxgi_output(device, &target_mon.device_name, target_mon.output_index)
+    {
+        if let Ok(desc) = output.GetDesc() {
+            if !desc.Monitor.0.is_null() {
+                return Some(desc.Monitor);
+            }
+        }
+    }
+    let pt = POINT {
+        x: target_mon.left + (target_mon.width as i32 / 2),
+        y: target_mon.top + (target_mon.height as i32 / 2),
+    };
+    let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if hmon.0.is_null() {
+        None
+    } else {
+        Some(hmon)
+    }
+}
+
+/// Tier 2 GPU monitor capture via Windows.Graphics.Capture (Win10 1903+ / Win11).
+/// Captures DirectX Flip-Model, Independent Flip, MPO, and fullscreen games (e.g. Valorant)
+/// zero-copy on GPU even when DXGI Desktop Duplication is unavailable.
+/// Caller thread must already have initialized WinRT/COM MTA via `ComMfGuard`.
+struct WgcMonitorCapture {
+    session: Option<GraphicsCaptureSession>,
+    frame_pool: Option<Direct3D11CaptureFramePool>,
+    _item: Option<GraphicsCaptureItem>,
+    d3d_winrt_device: Option<IDirect3DDevice>,
+    pool_w: i32,
+    pool_h: i32,
+}
+
+impl WgcMonitorCapture {
+    unsafe fn new(device: &ID3D11Device, target_mon: &DisplayTarget) -> Option<Self> {
+        ensure_process_mta_pinned();
+        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+            return None;
+        }
+        let hmon = resolve_target_hmonitor(device, target_mon)?;
+        let dxgi_dev: IDXGIDevice = device.cast().ok()?;
+        let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_dev).ok()?;
+        let d3d_winrt_device: IDirect3DDevice = inspectable.cast().ok()?;
+        let class_name = HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureItem");
+        let interop: IGraphicsCaptureItemInterop = RoGetActivationFactory(&class_name).ok()?;
+        let item: GraphicsCaptureItem = interop.CreateForMonitor(hmon).ok()?;
+        let sz = item.Size().ok()?;
+        if sz.Width <= 0 || sz.Height <= 0 {
+            return None;
+        }
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &d3d_winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            sz,
+        )
+        .ok()?;
+        let session = frame_pool.CreateCaptureSession(&item).ok()?;
+        let _ = session.SetIsBorderRequired(false);
+        let _ = session.SetIsCursorCaptureEnabled(true);
+        session.StartCapture().ok()?;
+
+        Some(Self {
+            session: Some(session),
+            frame_pool: Some(frame_pool),
+            _item: Some(item),
+            d3d_winrt_device: Some(d3d_winrt_device),
+            pool_w: sz.Width,
+            pool_h: sz.Height,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn acquire_latest_frame(
+        &mut self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        staging_tex: &mut Option<ID3D11Texture2D>,
+        staging_w: &mut u32,
+        staging_h: &mut u32,
+        tex_desc: &D3D11_TEXTURE2D_DESC,
+        cap_width: u32,
+        cap_height: u32,
+        need_ring_clear: &mut bool,
+    ) -> bool {
+        let Some(ref frame_pool) = self.frame_pool else {
+            return false;
+        };
+        let mut latest = None;
+        while let Ok(frame) = frame_pool.TryGetNextFrame() {
+            if let Some(prev) = latest.replace(frame) {
+                let _ = prev.Close();
+            }
+        }
+        let Some(frame) = latest else {
+            return false;
+        };
+
+        if let Ok(csz) = frame.ContentSize() {
+            if csz.Width > 0
+                && csz.Height > 0
+                && (csz.Width != self.pool_w || csz.Height != self.pool_h)
+            {
+                if let Some(ref d3d_dev) = self.d3d_winrt_device {
+                    let _ = frame_pool.Recreate(
+                        d3d_dev,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        csz,
+                    );
+                    self.pool_w = csz.Width;
+                    self.pool_h = csz.Height;
+                }
+            }
+        }
+
+        let mut copied = false;
+        if let Ok(surface) = frame.Surface() {
+            if let Ok(access) = surface.cast::<IDirect3DDxgiInterfaceAccess>() {
+                if let Ok(wgc_tex) = access.GetInterface::<ID3D11Texture2D>() {
+                    let mut wgc_desc = D3D11_TEXTURE2D_DESC::default();
+                    wgc_tex.GetDesc(&mut wgc_desc);
+                    if wgc_desc.Width > 0
+                        && wgc_desc.Height > 0
+                        && wgc_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+                    {
+                        if staging_tex.is_none()
+                            || wgc_desc.Width != *staging_w
+                            || wgc_desc.Height != *staging_h
+                        {
+                            *staging_w = wgc_desc.Width;
+                            *staging_h = wgc_desc.Height;
+                            let mut new_desc = *tex_desc;
+                            new_desc.Width = *staging_w;
+                            new_desc.Height = *staging_h;
+                            *staging_tex = None;
+                            let _ = device.CreateTexture2D(&new_desc, None, Some(staging_tex));
+                            *need_ring_clear = *staging_w != cap_width || *staging_h != cap_height;
+                        }
+                        if let Some(ref stex) = staging_tex {
+                            context.CopyResource(stex, &wgc_tex);
+                            context.Flush();
+                            copied = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = frame.Close();
+        copied
+    }
+}
+
+impl Drop for WgcMonitorCapture {
+    fn drop(&mut self) {
+        if let Some(s) = self.session.take() {
+            let _ = s.Close();
+            drop(s);
+        }
+        if let Some(fp) = self.frame_pool.take() {
+            let _ = fp.Close();
+            drop(fp);
+        }
+        self._item = None;
+        self.d3d_winrt_device = None;
+    }
 }
 
 pub fn probe_hardware_codec_caps() -> HardwareCodecCaps {
@@ -4630,6 +5028,99 @@ mod tests {
                 "{} should be allowed for Active Game Audio loopback lock",
                 game
             );
+        }
+    }
+
+    #[test]
+    fn capture_helpers_and_wgc_fallback_init_cleanly() {
+        let engine = ReplayEngine::new(ReplayConfig::default());
+        let displays = engine.displays.lock().unwrap().clone();
+        assert!(!displays.is_empty(), "at least one display must be enumerated");
+
+        // Run across two sequential worker thread lifecycles to verify stop/start cycles
+        // never dangle WinRT FactoryCache pointers after ComMfGuard drops.
+        for _cycle in 0..2 {
+            let mon = displays[0].clone();
+            let h = thread::spawn(move || unsafe {
+                let _com = ComMfGuard::new();
+                set_capture_thread_dpi_aware();
+
+                let mut dev_opt: Option<ID3D11Device> = None;
+                let mut ctx_opt: Option<ID3D11DeviceContext> = None;
+                let levels = [D3D_FEATURE_LEVEL_11_0];
+                let _ = D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(&levels),
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev_opt),
+                    None,
+                    Some(&mut ctx_opt),
+                );
+                let dev = dev_opt.expect("D3D11 hardware device");
+                let _ctx = ctx_opt.expect("D3D11 context");
+
+                let matched = find_matching_dxgi_output(&dev, &mon.device_name, mon.output_index)
+                    .expect("find_matching_dxgi_output should locate primary monitor");
+                let desc = matched.GetDesc().expect("IDXGIOutput::GetDesc");
+                if !mon.device_name.is_empty() {
+                    assert!(
+                        utf16_slice_to_string(&desc.DeviceName)
+                            .eq_ignore_ascii_case(&mon.device_name),
+                        "matched output DeviceName should equal target monitor"
+                    );
+                }
+
+                let hmon = resolve_target_hmonitor(&dev, &mon)
+                    .expect("resolve_target_hmonitor should return non-null HMONITOR");
+                assert!(!hmon.0.is_null());
+
+                let dupl = try_create_output_duplication(&dev, &mon.device_name, mon.output_index);
+                drop(dupl);
+
+                if GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+                    let mut wgc = WgcMonitorCapture::new(&dev, &mon)
+                        .expect("WgcMonitorCapture::new should succeed when WGC is supported");
+                    let tex_desc = D3D11_TEXTURE2D_DESC {
+                        Width: mon.width,
+                        Height: mon.height,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0)
+                            as u32,
+                        CPUAccessFlags: 0,
+                        MiscFlags: 0,
+                    };
+                    let mut staging: Option<ID3D11Texture2D> = None;
+                    let _ = dev.CreateTexture2D(&tex_desc, None, Some(&mut staging));
+                    let mut sw = mon.width;
+                    let mut sh = mon.height;
+                    let mut clear = false;
+                    for _ in 0..8 {
+                        if wgc.acquire_latest_frame(
+                            &dev,
+                            &_ctx,
+                            &mut staging,
+                            &mut sw,
+                            &mut sh,
+                            &tex_desc,
+                            mon.width,
+                            mon.height,
+                            &mut clear,
+                        ) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    drop(wgc);
+                }
+            });
+            h.join().expect("capture helper worker thread must not panic");
         }
     }
 }
